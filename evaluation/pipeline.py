@@ -242,9 +242,9 @@ def run_coarse_fused(model_primary, model_secondary, dataloader, args):
         accuracies[k] = np.mean(accuracies[k])
         accuracies_close[k] = np.mean(accuracies_close[k])
 
-    print("Retrieval Accs:")
+    print("Exact-cell Retrieval Recall@K:")
     print(accuracies)
-    print("Retrieval Accs Close:")
+    print("Legacy cell-center <= cell_size/2 diagnostic Recall@K:")
     print(accuracies_close)
 
     sample_accuracies = {k: {t: [] for t in args.threshs} for k in args.top_k}
@@ -331,9 +331,9 @@ def run_coarse(model, dataloader, args):
     else:
         retrievals = [retrieval_dict[idx].tolist() for idx in range(len(retrieval_dict))]
 
-    print("Retrieval Accs:")
+    print("Exact-cell Retrieval Recall@K:")
     print(retrieval_accuracies)
-    print("Retrieval Accs Close:")
+    print("Legacy cell-center <= cell_size/2 diagnostic Recall@K:")
     print(retrieval_accuracies_close)
     assert len(retrievals) == len(dataloader.dataset.all_poses)
 

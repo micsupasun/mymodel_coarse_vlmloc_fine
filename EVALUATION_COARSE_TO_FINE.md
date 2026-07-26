@@ -15,6 +15,15 @@ requested modified protocol:
 - All fine backends use seed 42 and the same `R@5/10/15 m` implementation.
 - Results are reported at top-k `1, 3, 5, 10`.
 
+Stage 1 reports two deliberately separate diagnostics:
+
+- **Exact-cell Retrieval Recall@K**: the ground-truth cell ID occurs in the
+  first K retrieved IDs. This is the coarse metric used by the local ablation
+  table.
+- **Cell-center localization R@5/10/15 m**: every candidate predicts its cell
+  center. This is a distance-based baseline and must not be compared with
+  exact-cell Retrieval Recall@K.
+
 The paper's Table 8 is not this exact experiment. Table 8 uses shared **Top-1
 CMMLoc retrieval**, reports 11,404 KITTI360Pose test samples, and reports only
 `R@5/10/15`. The modified experiment therefore must not be labeled as a direct
@@ -123,6 +132,11 @@ Every structurally compatible backend then runs a one-query forward smoke test
 on the selected device. It verifies finite values, output shapes, query order,
 and candidate-cell order. A failed smoke test changes the backend preflight to
 FAIL. Full stage-2 inference starts only if all selected backends pass.
+The smoke tests save and restore Python, NumPy, CPU Torch, and CUDA RNG states,
+so they do not change the stochastic `FixedPoints(256)` subsets used by the
+real evaluation. Stage 1 otherwise preserves the original source protocol:
+seed 42 is set once before dataset/model construction and is not reset
+immediately before coarse inference.
 
 ## Windows CMD commands on the GPU machine
 

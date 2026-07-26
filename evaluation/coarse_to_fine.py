@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -399,6 +400,25 @@ def _resolve_device(specification: str) -> torch.device:
     return device
 
 
+def _capture_rng_state() -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+    }
+
+
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if state["torch_cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
 @torch.no_grad()
 def _smoke_my_coarse(
     *,
@@ -409,6 +429,7 @@ def _smoke_my_coarse(
 ) -> None:
     if not check.compatible:
         return
+    caller_rng_state = _capture_rng_state()
     try:
         seed_everything(args.seed)
         model = check.model.to(device)
@@ -456,6 +477,7 @@ def _smoke_my_coarse(
             check.model.to("cpu")
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        _restore_rng_state(caller_rng_state)
 
 
 @torch.no_grad()
@@ -469,6 +491,7 @@ def _smoke_fine_backend(
 ) -> None:
     if not check.compatible:
         return
+    caller_rng_state = _capture_rng_state()
     try:
         seed_everything(args.seed)
         model = check.model.to(device)
@@ -511,6 +534,7 @@ def _smoke_fine_backend(
             check.model.to("cpu")
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        _restore_rng_state(caller_rng_state)
 
 
 def _native_metrics(
@@ -522,6 +546,31 @@ def _native_metrics(
             for threshold, value in threshold_values.items()
         }
         for k, threshold_values in metrics.items()
+    }
+
+
+def _exact_cell_retrieval_recall(
+    retrievals: list[list[str]],
+    dataset: Kitti360CoarseDatasetMulti,
+    top_k: list[int],
+) -> dict[int, float]:
+    if len(retrievals) != len(dataset.all_poses):
+        raise RuntimeError(
+            f"retrieval count {len(retrievals)} != query count "
+            f"{len(dataset.all_poses)}"
+        )
+    return {
+        int(k): float(
+            np.mean(
+                [
+                    str(pose.cell_id) in candidate_ids[:k]
+                    for pose, candidate_ids in zip(
+                        dataset.all_poses, retrievals
+                    )
+                ]
+            )
+        )
+        for k in top_k
     }
 
 
@@ -701,7 +750,6 @@ def command_stage1(cli: argparse.Namespace) -> int:
         print(f"Coarse preflight failed: {coarse_check.report_path}", file=sys.stderr)
         return 2
 
-    seed_everything(cli.seed)
     model = coarse_check.model.to(device)
     dataloader = DataLoader(
         dataset,
@@ -711,7 +759,14 @@ def command_stage1(cli: argparse.Namespace) -> int:
         num_workers=0,
     )
     retrievals, metrics = run_coarse(model, dataloader, args)
-    print_accuracies(metrics, "my_model coarse")
+    retrieval_recall = _exact_cell_retrieval_recall(
+        retrievals, dataset, args.top_k
+    )
+    print(f"my_model exact-cell Retrieval Recall@K: {retrieval_recall}")
+    print_accuracies(
+        metrics,
+        "Cell-center localization baseline (not exact-cell retrieval)",
+    )
     native_metrics = _native_metrics(metrics)
     checkpoint_hash = sha256_file(paths["my_model_coarse"])
     manifest_path = output_dir / "retrieval_manifest.json"
@@ -730,6 +785,10 @@ def command_stage1(cli: argparse.Namespace) -> int:
             "trainable_rerank_topn": args.trainable_rerank_topn,
             "batch_size": args.batch_size,
             "num_workers": 0,
+            "rng_protocol": (
+                "seed=42 once before dataset/model construction; preflight "
+                "smoke saves and restores caller RNG state"
+            ),
         },
     )
     (output_dir / "coarse_metrics.json").write_text(
@@ -738,7 +797,18 @@ def command_stage1(cli: argparse.Namespace) -> int:
                 "schema_version": 1,
                 "dataset": signature,
                 "checkpoint_sha256": checkpoint_hash,
-                "metrics": native_metrics,
+                "metric_definitions": {
+                    "exact_cell_retrieval_recall": (
+                        "GT cell ID occurs in the first K retrieved cell IDs"
+                    ),
+                    "cell_center_localization_recall": (
+                        "world-distance R@5/10/15m when every retrieved cell "
+                        "predicts its normalized center [0.5, 0.5]; this is a "
+                        "diagnostic baseline, not retrieval recall"
+                    ),
+                },
+                "exact_cell_retrieval_recall": retrieval_recall,
+                "cell_center_localization_recall": native_metrics,
             },
             indent=2,
             sort_keys=True,
@@ -764,6 +834,13 @@ def command_stage2(cli: argparse.Namespace) -> int:
     signature = dataset_signature(dataset)
     manifest, retrievals = load_and_validate_retrieval_manifest(
         manifest_path, dataset=dataset, seed=cli.seed
+    )
+    coarse_retrieval_recall = _exact_cell_retrieval_recall(
+        retrievals, dataset, args.top_k
+    )
+    print(
+        "Shared manifest exact-cell Retrieval Recall@K: "
+        f"{coarse_retrieval_recall}"
     )
 
     preflight_dir = output_dir / "preflight"
@@ -800,6 +877,7 @@ def command_stage2(cli: argparse.Namespace) -> int:
         "retrieval_rows_sha256": manifest["retrieval_rows_sha256"],
         "dataset": signature,
         "seed": cli.seed,
+        "coarse_exact_cell_retrieval_recall": coarse_retrieval_recall,
         "metrics": {},
     }
     for check in checks:
