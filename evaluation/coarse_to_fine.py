@@ -11,6 +11,7 @@ import json
 import random
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -54,7 +55,7 @@ from evaluation.fine_backends import (
     t5_config_mismatches,
     validate_sentence_preprocessing,
 )
-from evaluation.pipeline import run_coarse
+from evaluation.pipeline import rerank_candidate_cells, run_coarse
 from evaluation.utils import calc_sample_accuracies, print_accuracies
 from models.coarse.cell_retrieval import CellRetrievalNetwork
 
@@ -155,6 +156,84 @@ def _coarse_rerank_record(args: ModelConfig) -> dict[str, Any]:
             "color_label": args.rerank_color_weight,
         },
     }
+
+
+def _coarse_rerank_console_text(args: ModelConfig) -> str:
+    return (
+        f"mode={args.coarse_rerank_mode}, topn={args.rerank_topn}, "
+        f"use_model_reranker={args.use_model_reranker}, "
+        f"weights=(base={args.rerank_base_weight}, "
+        f"label={args.rerank_label_weight}, "
+        f"color_label={args.rerank_color_weight})"
+    )
+
+
+def _manifest_coarse_rerank_record(
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    configuration = manifest.get("coarse_configuration")
+    if not isinstance(configuration, dict):
+        raise RuntimeError("manifest has no coarse_configuration record")
+    required_keys = (
+        "coarse_rerank_mode",
+        "post_retrieval_rerank_topn",
+        "checkpoint_reranker_head_built",
+        "use_model_reranker",
+        "structured_rerank_weights",
+    )
+    missing = [key for key in required_keys if key not in configuration]
+    if missing:
+        raise RuntimeError(
+            "manifest predates explicit coarse-policy provenance; missing "
+            f"{missing}. Regenerate Stage 1 with --coarse-rerank-mode."
+        )
+    return {key: configuration[key] for key in required_keys}
+
+
+def _independent_structured_rerank(
+    pose: Any,
+    candidate_cell_ids: np.ndarray,
+    candidate_scores: np.ndarray,
+    cells_by_id: dict[str, Any],
+    args: ModelConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reference implementation used only by preflight policy validation."""
+
+    required_labels = Counter(
+        description.object_label for description in pose.descriptions
+    )
+    required_color_labels = Counter(
+        (description.object_color_text, description.object_label)
+        for description in pose.descriptions
+    )
+
+    def coverage(required: Counter[Any], available: Counter[Any]) -> float:
+        total = sum(required.values())
+        if total == 0:
+            return 0.0
+        return sum(
+            min(count, available.get(key, 0))
+            for key, count in required.items()
+        ) / total
+
+    combined_scores = []
+    for cell_id, base_score in zip(candidate_cell_ids, candidate_scores):
+        cell = cells_by_id[str(cell_id)]
+        cell_labels = Counter(obj.label for obj in cell.objects)
+        cell_color_labels = Counter(
+            (obj.get_color_text(), obj.label) for obj in cell.objects
+        )
+        combined_scores.append(
+            args.rerank_base_weight * float(base_score)
+            + args.rerank_label_weight
+            * coverage(required_labels, cell_labels)
+            + args.rerank_color_weight
+            * coverage(required_color_labels, cell_color_labels)
+        )
+
+    combined_scores_array = np.asarray(combined_scores, dtype=np.float32)
+    order = np.argsort(-combined_scores_array)
+    return candidate_cell_ids[order], combined_scores_array
 
 
 def _architecture_record(args: ModelConfig, backend_class: str) -> dict[str, Any]:
@@ -304,6 +383,7 @@ def _write_preflight_summary(
     *,
     signature: dict[str, Any],
     checks: list[BackendPreflight],
+    coarse_rerank_policy: dict[str, Any],
 ) -> Path:
     path = output_dir / "preflight_summary.json"
     payload = {
@@ -314,6 +394,7 @@ def _write_preflight_summary(
             "seed": DEFAULT_SEED,
             "top_k": list(REQUIRED_TOP_K),
             "thresholds_m": list(REQUIRED_THRESHOLDS),
+            "coarse_rerank_policy": coarse_rerank_policy,
         },
         "backends": {
             check.name: {
@@ -420,6 +501,31 @@ def _record_smoke_result(
     )
 
 
+def _print_coarse_policy_smoke(check: BackendPreflight) -> None:
+    report = json.loads(check.report_path.read_text(encoding="utf-8"))
+    smoke = report.get("smoke_test", {})
+    if not smoke.get("passed"):
+        print(
+            "Coarse policy smoke: FAIL "
+            f"({smoke.get('error', 'no smoke-test result')})"
+        )
+        return
+    policy = smoke.get("rerank_policy")
+    if not isinstance(policy, dict):
+        print("Coarse policy smoke: FAIL (rerank_policy evidence missing)")
+        return
+    print(
+        "Coarse policy smoke: PASS, "
+        f"mode={policy['coarse_rerank_mode']}, "
+        f"candidates={policy['candidate_count']}, "
+        f"use_model_reranker={policy['use_model_reranker']}, "
+        f"learned_head_exercised={policy['learned_head_exercised']}, "
+        f"independent_reference_match="
+        f"{policy['independent_reference_match']}, "
+        f"changed_candidate_order={policy['changed_candidate_order']}"
+    )
+
+
 def _resolve_device(specification: str) -> torch.device:
     device = torch.device(specification)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -481,6 +587,135 @@ def _smoke_my_coarse(
             cell_encoding
         ).all():
             raise RuntimeError("coarse smoke test produced NaN or Inf")
+
+        cells_by_id = {str(cell.id): cell for cell in dataset.all_cells}
+        candidate_count = max(max(args.top_k), args.rerank_topn)
+        if candidate_count > len(dataset.all_cells):
+            raise RuntimeError(
+                f"coarse policy smoke requests {candidate_count} candidates "
+                f"from only {len(dataset.all_cells)} cells"
+            )
+        candidate_ids = np.asarray(
+            [str(cell.id) for cell in dataset.all_cells[:candidate_count]]
+        )
+        candidate_scores = np.linspace(
+            1.0, 0.0, candidate_count, dtype=np.float64
+        )
+
+        policy_reference_match: bool | None = None
+        learned_head_exercised = False
+        structured_all_cell_score_range = None
+        if args.coarse_rerank_mode == "structured_rerank":
+            class LearnedHeadForbidden:
+                reranker_head = object()
+
+                @staticmethod
+                def combine_rerank_scores(*_unused: Any) -> Any:
+                    raise RuntimeError(
+                        "structured_rerank unexpectedly called learned head"
+                    )
+
+            all_cell_ids = np.asarray(
+                [str(cell.id) for cell in dataset.all_cells]
+            )
+            _, all_cell_structured_scores = _independent_structured_rerank(
+                dataset.all_poses[0],
+                all_cell_ids,
+                np.zeros(len(all_cell_ids), dtype=np.float64),
+                cells_by_id,
+                args,
+            )
+            worst_index = int(np.argmin(all_cell_structured_scores))
+            best_index = int(np.argmax(all_cell_structured_scores))
+            score_min = float(all_cell_structured_scores[worst_index])
+            score_max = float(all_cell_structured_scores[best_index])
+            structured_all_cell_score_range = [score_min, score_max]
+            if best_index == worst_index or score_max <= score_min:
+                raise RuntimeError(
+                    "structured policy smoke could not find real cells with "
+                    "different fixed structured scores"
+                )
+
+            worst_id = str(all_cell_ids[worst_index])
+            best_id = str(all_cell_ids[best_index])
+            filler_ids = [
+                str(cell_id)
+                for cell_id in all_cell_ids
+                if str(cell_id) not in {worst_id, best_id}
+            ][: candidate_count - 2]
+            candidate_ids = np.asarray(
+                [worst_id, *filler_ids, best_id]
+            )
+            # Keep base-score differences negligible so the known low/high
+            # structured-score cells guarantee a non-trivial reorder.
+            candidate_scores = np.linspace(
+                1e-6, 0.0, candidate_count, dtype=np.float64
+            )
+            expected_ids, reference_scores = _independent_structured_rerank(
+                dataset.all_poses[0],
+                candidate_ids,
+                candidate_scores,
+                cells_by_id,
+                args,
+            )
+            reranked_ids = rerank_candidate_cells(
+                dataset.all_poses[0],
+                candidate_ids,
+                candidate_scores,
+                cells_by_id,
+                args,
+                LearnedHeadForbidden(),
+            )
+            policy_reference_match = bool(
+                np.array_equal(reranked_ids, expected_ids)
+            )
+            if not policy_reference_match:
+                raise RuntimeError(
+                    "structured rerank output differs from independent "
+                    "fixed-score reference"
+                )
+            if np.array_equal(reranked_ids, candidate_ids):
+                raise RuntimeError(
+                    "structured rerank matched the reference but did not "
+                    "change the deliberately ordered real-cell candidates"
+                )
+            reference_score_range = [
+                float(np.min(reference_scores)),
+                float(np.max(reference_scores)),
+            ]
+        elif args.coarse_rerank_mode == "learned_reranker":
+            reranked_ids = rerank_candidate_cells(
+                dataset.all_poses[0],
+                candidate_ids,
+                candidate_scores,
+                cells_by_id,
+                args,
+                model,
+            )
+            learned_head_exercised = True
+            reference_score_range = None
+        else:
+            reranked_ids = rerank_candidate_cells(
+                dataset.all_poses[0],
+                candidate_ids,
+                candidate_scores,
+                cells_by_id,
+                args,
+                model,
+            )
+            if not np.array_equal(reranked_ids, candidate_ids):
+                raise RuntimeError("coarse rerank mode none changed candidate order")
+            policy_reference_match = True
+            reference_score_range = None
+
+        if len(reranked_ids) != candidate_count:
+            raise RuntimeError(
+                f"coarse policy smoke returned {len(reranked_ids)} candidates, "
+                f"expected {candidate_count}"
+            )
+        if len(set(str(value) for value in reranked_ids)) != candidate_count:
+            raise RuntimeError("coarse policy smoke returned duplicate candidates")
+
         _record_smoke_result(
             check,
             result={
@@ -495,6 +730,28 @@ def _smoke_my_coarse(
                     .detach()
                     .cpu()
                 ),
+                "rerank_policy": {
+                    **_coarse_rerank_record(args),
+                    "candidate_count": candidate_count,
+                    "query_index": 0,
+                    "input_first_10_cell_ids": [
+                        str(value) for value in candidate_ids[:10]
+                    ],
+                    "output_first_10_cell_ids": [
+                        str(value) for value in reranked_ids[:10]
+                    ],
+                    "changed_candidate_order": bool(
+                        not np.array_equal(reranked_ids, candidate_ids)
+                    ),
+                    "independent_reference_match": policy_reference_match,
+                    "learned_head_exercised": learned_head_exercised,
+                    "independent_reference_score_range": (
+                        reference_score_range
+                    ),
+                    "structured_all_cell_score_range": (
+                        structured_all_cell_score_range
+                    ),
+                },
             },
         )
     except Exception as error:
@@ -705,6 +962,7 @@ def command_preflight(cli: argparse.Namespace) -> int:
     dataset = _load_test_dataset(args)
     signature = dataset_signature(dataset)
     device = _resolve_device(cli.device)
+    print(f"Coarse policy preflight: {_coarse_rerank_console_text(args)}")
 
     checks = [
         _preflight_my_coarse(
@@ -716,6 +974,7 @@ def command_preflight(cli: argparse.Namespace) -> int:
     _smoke_my_coarse(
         check=checks[0], dataset=dataset, args=args, device=device
     )
+    _print_coarse_policy_smoke(checks[0])
     if checks[0].model is not None:
         del checks[0].model
         checks[0].model = None
@@ -743,7 +1002,10 @@ def command_preflight(cli: argparse.Namespace) -> int:
             del check.model
             check.model = None
     summary = _write_preflight_summary(
-        output_dir, signature=signature, checks=checks
+        output_dir,
+        signature=signature,
+        checks=checks,
+        coarse_rerank_policy=_coarse_rerank_record(args),
     )
     print(f"Preflight report: {summary}")
     for check in checks:
@@ -770,22 +1032,19 @@ def command_stage1(cli: argparse.Namespace) -> int:
     _smoke_my_coarse(
         check=coarse_check, dataset=dataset, args=args, device=device
     )
+    _print_coarse_policy_smoke(coarse_check)
     _write_preflight_summary(
-        output_dir / "preflight", signature=signature, checks=[coarse_check]
+        output_dir / "preflight",
+        signature=signature,
+        checks=[coarse_check],
+        coarse_rerank_policy=_coarse_rerank_record(args),
     )
     if not coarse_check.compatible:
         print(f"Coarse preflight failed: {coarse_check.report_path}", file=sys.stderr)
         return 2
 
     model = coarse_check.model.to(device)
-    print(
-        "Coarse rerank policy: "
-        f"{args.coarse_rerank_mode}, topn={args.rerank_topn}, "
-        f"use_model_reranker={args.use_model_reranker}, "
-        f"weights=(base={args.rerank_base_weight}, "
-        f"label={args.rerank_label_weight}, "
-        f"color_label={args.rerank_color_weight})"
-    )
+    print(f"Coarse rerank policy: {_coarse_rerank_console_text(args)}")
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -870,6 +1129,11 @@ def command_stage2(cli: argparse.Namespace) -> int:
     manifest, retrievals = load_and_validate_retrieval_manifest(
         manifest_path, dataset=dataset, seed=cli.seed
     )
+    manifest_coarse_policy = _manifest_coarse_rerank_record(manifest)
+    print(
+        "Shared manifest coarse rerank policy: "
+        f"{json.dumps(manifest_coarse_policy, sort_keys=True)}"
+    )
     coarse_retrieval_recall = _exact_cell_retrieval_recall(
         retrievals, dataset, args.top_k
     )
@@ -896,7 +1160,10 @@ def command_stage2(cli: argparse.Namespace) -> int:
             device=device,
         )
     summary = _write_preflight_summary(
-        preflight_dir, signature=signature, checks=checks
+        preflight_dir,
+        signature=signature,
+        checks=checks,
+        coarse_rerank_policy=manifest_coarse_policy,
     )
     if not all(check.compatible for check in checks):
         print(
@@ -912,6 +1179,7 @@ def command_stage2(cli: argparse.Namespace) -> int:
         "retrieval_rows_sha256": manifest["retrieval_rows_sha256"],
         "dataset": signature,
         "seed": cli.seed,
+        "coarse_rerank_policy": manifest_coarse_policy,
         "coarse_exact_cell_retrieval_recall": coarse_retrieval_recall,
         "metrics": {},
     }

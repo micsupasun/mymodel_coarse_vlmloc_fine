@@ -148,11 +148,21 @@ Every structurally compatible backend then runs a one-query forward smoke test
 on the selected device. It verifies finite values, output shapes, query order,
 and candidate-cell order. A failed smoke test changes the backend preflight to
 FAIL. Full stage-2 inference starts only if all selected backends pass.
+The coarse smoke test additionally runs the selected rerank policy over 50
+real dataset cells. For `structured_rerank`, it compares the production
+reranker output against an independent fixed-score reference and uses a model
+sentinel that raises if the learned head is called. The audit records the
+input/output IDs, whether ordering changed, whether the independent reference
+matched, and whether the learned head was exercised.
 The smoke tests save and restore Python, NumPy, CPU Torch, and CUDA RNG states,
 so they do not change the stochastic `FixedPoints(256)` subsets used by the
 real evaluation. Stage 1 otherwise preserves the original source protocol:
 seed 42 is set once before dataset/model construction and is not reset
 immediately before coarse inference.
+
+Stage 2 rejects older manifests that do not contain the explicit coarse
+policy, top-N, learned-head flag, and structured weights. This prevents a
+v1.1 retrieval manifest from being silently used for a v1.4 comparison.
 
 ## Windows CMD commands on the GPU machine
 
@@ -167,6 +177,12 @@ write evidence for the two known blockers):
 
 ```cmd
 python -m evaluation.coarse_to_fine preflight --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --output-dir "evaluation_outputs\preflight_all" --backends vlmloc cmmloc mncl
+```
+
+Policy-specific preflight for the currently runnable v1.4 + CMMLoc path:
+
+```cmd
+python -m evaluation.coarse_to_fine preflight --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --batch-size 16 --device "cuda:0" --coarse-rerank-mode structured_rerank --output-dir "evaluation_outputs\preflight_structured_rerank_v1_4_v2" --backends cmmloc
 ```
 
 Stage 1 using the requested v1.4 fixed structured-rerank policy, after
