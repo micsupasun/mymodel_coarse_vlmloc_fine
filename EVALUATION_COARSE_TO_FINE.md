@@ -24,6 +24,22 @@ Stage 1 reports two deliberately separate diagnostics:
   center. This is a distance-based baseline and must not be compared with
   exact-cell Retrieval Recall@K.
 
+The coarse checkpoint contains a learned reranker head, but the historical
+ablation table evaluates more than one inference policy with that checkpoint:
+
+- `--coarse-rerank-mode learned_reranker` reproduces
+  `v1.1_mncl_structured_rerank`.
+- `--coarse-rerank-mode structured_rerank` reproduces
+  `v1.4_structured_rerank`: rerank the base top-50 using
+  `base_score + 0.6 * label_coverage + 1.0 * color_label_coverage`, without
+  using the learned reranker head.
+- `--coarse-rerank-mode none` keeps the base retrieval ranking.
+
+The selected policy, top-N, learned-head flag, and all fixed weights are stored
+inside the retrieval manifest and coarse metrics. When reporting v1.4, label
+the coarse method as `my_model embeddings + fixed structured rerank (v1.4
+policy)`, not as the learned `mncl_structured_rerank` inference result.
+
 The paper's Table 8 is not this exact experiment. Table 8 uses shared **Top-1
 CMMLoc retrieval**, reports 11,404 KITTI360Pose test samples, and reports only
 `R@5/10/15`. The modified experiment therefore must not be labeled as a direct
@@ -153,16 +169,17 @@ write evidence for the two known blockers):
 python -m evaluation.coarse_to_fine preflight --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --output-dir "evaluation_outputs\preflight_all" --backends vlmloc cmmloc mncl
 ```
 
-Stage 1, after `my_model` coarse preflight passes:
+Stage 1 using the requested v1.4 fixed structured-rerank policy, after
+`my_model` coarse preflight passes:
 
 ```cmd
-python -m evaluation.coarse_to_fine stage1 --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --output-dir "evaluation_outputs\stage1_my_model"
+python -m evaluation.coarse_to_fine stage1 --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --batch-size 16 --device "cuda:0" --coarse-rerank-mode structured_rerank --output-dir "evaluation_outputs\stage1_structured_rerank_v1_4"
 ```
 
 Stage 2 for the currently verifiable CMMLoc backend:
 
 ```cmd
-python -m evaluation.coarse_to_fine stage2 --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --manifest "evaluation_outputs\stage1_my_model\retrieval_manifest.json" --output-dir "evaluation_outputs\stage2_cmmloc" --backends cmmloc
+python -m evaluation.coarse_to_fine stage2 --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --manifest "evaluation_outputs\stage1_structured_rerank_v1_4\retrieval_manifest.json" --output-dir "evaluation_outputs\stage2_cmmloc_from_v1_4" --backends cmmloc
 ```
 
 The preflight directory, stage-1 directory, and stage-2 directory are separate.

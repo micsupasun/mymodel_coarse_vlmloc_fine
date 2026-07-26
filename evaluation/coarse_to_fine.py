@@ -73,6 +73,14 @@ class ModelConfig(dict):
 
 
 def _model_config(cli: argparse.Namespace) -> ModelConfig:
+    rerank_mode = cli.coarse_rerank_mode
+    if rerank_mode not in {
+        "learned_reranker",
+        "structured_rerank",
+        "none",
+    }:
+        raise ValueError(f"unsupported coarse rerank mode: {rerank_mode}")
+
     return ModelConfig(
         base_path=str(Path(cli.data_root).resolve()),
         batch_size=cli.batch_size,
@@ -112,10 +120,15 @@ def _model_config(cli: argparse.Namespace) -> ModelConfig:
         mncl_proj_dim=256,
         use_trainable_reranker=True,
         reranker_hidden_dim=32,
-        trainable_rerank_topn=50,
-        # Disable the older second reranker in evaluation.pipeline.run_coarse.
-        rerank_topn=0,
-        use_model_reranker=False,
+        # Build the learned head so the checkpoint is audited exactly, but
+        # reproduce the original ablation script's post-retrieval rerank path.
+        trainable_rerank_topn=0,
+        rerank_topn=0 if rerank_mode == "none" else 50,
+        use_model_reranker=rerank_mode == "learned_reranker",
+        rerank_base_weight=1.0,
+        rerank_label_weight=0.6,
+        rerank_color_weight=1.0,
+        coarse_rerank_mode=rerank_mode,
         fine_embed_dim=128,
         fine_num_decoder_heads=4,
         fine_num_decoder_layers=2,
@@ -128,6 +141,20 @@ def _model_config(cli: argparse.Namespace) -> ModelConfig:
         prealign_color_path="",
         prealign_mlp_path="",
     )
+
+
+def _coarse_rerank_record(args: ModelConfig) -> dict[str, Any]:
+    return {
+        "coarse_rerank_mode": args.coarse_rerank_mode,
+        "post_retrieval_rerank_topn": args.rerank_topn,
+        "checkpoint_reranker_head_built": bool(args.use_trainable_reranker),
+        "use_model_reranker": args.use_model_reranker,
+        "structured_rerank_weights": {
+            "base": args.rerank_base_weight,
+            "label": args.rerank_label_weight,
+            "color_label": args.rerank_color_weight,
+        },
+    }
 
 
 def _architecture_record(args: ModelConfig, backend_class: str) -> dict[str, Any]:
@@ -186,7 +213,7 @@ def _preflight_my_coarse(
                 "sentence_preprocessing": sentence_preprocessing,
                 "use_trainable_reranker": True,
                 "reranker_hidden_dim": args.reranker_hidden_dim,
-                "trainable_rerank_topn": args.trainable_rerank_topn,
+                **_coarse_rerank_record(args),
             }
         )
         report = audit_and_load_checkpoint(
@@ -751,6 +778,14 @@ def command_stage1(cli: argparse.Namespace) -> int:
         return 2
 
     model = coarse_check.model.to(device)
+    print(
+        "Coarse rerank policy: "
+        f"{args.coarse_rerank_mode}, topn={args.rerank_topn}, "
+        f"use_model_reranker={args.use_model_reranker}, "
+        f"weights=(base={args.rerank_base_weight}, "
+        f"label={args.rerank_label_weight}, "
+        f"color_label={args.rerank_color_weight})"
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -781,8 +816,7 @@ def command_stage1(cli: argparse.Namespace) -> int:
             **_architecture_record(
                 args, "models.coarse.cell_retrieval.CellRetrievalNetwork"
             ),
-            "trainable_reranker_enabled": True,
-            "trainable_rerank_topn": args.trainable_rerank_topn,
+            **_coarse_rerank_record(args),
             "batch_size": args.batch_size,
             "num_workers": 0,
             "rng_protocol": (
@@ -797,6 +831,7 @@ def command_stage1(cli: argparse.Namespace) -> int:
                 "schema_version": 1,
                 "dataset": signature,
                 "checkpoint_sha256": checkpoint_hash,
+                "coarse_rerank_policy": _coarse_rerank_record(args),
                 "metric_definitions": {
                     "exact_cell_retrieval_recall": (
                         "GT cell ID occurs in the first K retrieved cell IDs"
@@ -935,6 +970,16 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--coarse-rerank-mode",
+        choices=("learned_reranker", "structured_rerank", "none"),
+        default="learned_reranker",
+        help=(
+            "learned_reranker reproduces ablation v1.1; structured_rerank "
+            "reproduces v1.4 with fixed base/label/color-label weights; none "
+            "uses the base retrieval ranking."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
