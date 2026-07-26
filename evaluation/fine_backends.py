@@ -18,7 +18,7 @@ FROZEN_TEXT_PREFIXES = ("language_encoder.llm_model.",)
 T5_LARGE_CONFIG = {
     "model_type": "t5",
     "d_model": 1024,
-    "d_ff": 2816,
+    "d_ff": 4096,
     "num_layers": 24,
     "num_heads": 16,
     "vocab_size": 32128,
@@ -46,8 +46,13 @@ def t5_config_record(config: Any) -> dict[str, Any]:
     return {key: getattr(config, key, None) for key in T5_LARGE_CONFIG}
 
 
-def is_t5_large(config: Any) -> bool:
-    return t5_config_record(config) == T5_LARGE_CONFIG
+def t5_config_mismatches(config: Any) -> dict[str, dict[str, Any]]:
+    actual = t5_config_record(config)
+    return {
+        key: {"expected": expected, "actual": actual[key]}
+        for key, expected in T5_LARGE_CONFIG.items()
+        if actual[key] != expected
+    }
 
 
 def validate_sentence_preprocessing() -> dict[str, Any]:
@@ -125,16 +130,21 @@ def preflight_cmmloc(
     except Exception:
         return BackendPreflight("cmmloc", False, report_path)
 
-    if not is_t5_large(llm_config):
+    config_mismatches = t5_config_mismatches(llm_config)
+    if config_mismatches:
         report["compatible"] = False
-        report["load_succeeded"] = False
+        report["post_load_validation_succeeded"] = False
+        report["text_backbone_config_mismatches"] = config_mismatches
         report["post_load_error"] = (
-            "CMMLoc fine source/checkpoint requires the T5-large 1024-dimensional "
-            "text backbone."
+            f"CMMLoc fine requires canonical T5-large config; mismatches: "
+            f"{config_mismatches}"
         )
         _write_report(report_path, report)
         return BackendPreflight("cmmloc", False, report_path)
 
+    report["post_load_validation_succeeded"] = True
+    report["text_backbone_config_mismatches"] = {}
+    _write_report(report_path, report)
     return BackendPreflight("cmmloc", True, report_path, model)
 
 

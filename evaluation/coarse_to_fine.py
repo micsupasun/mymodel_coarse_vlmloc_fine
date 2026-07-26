@@ -46,11 +46,11 @@ from evaluation.fine_backends import (
     BackendPreflight,
     FROZEN_TEXT_PREFIXES,
     T5_LARGE_CONFIG,
-    is_t5_large,
     preflight_cmmloc,
     preflight_mncl,
     preflight_vlmloc,
     t5_config_record,
+    t5_config_mismatches,
     validate_sentence_preprocessing,
 )
 from evaluation.pipeline import run_coarse
@@ -196,12 +196,14 @@ def _preflight_my_coarse(
             allowed_missing_prefixes=FROZEN_TEXT_PREFIXES,
             architecture=architecture,
         )
-        if not is_t5_large(llm_config):
+        config_mismatches = t5_config_mismatches(llm_config)
+        if config_mismatches:
             report["compatible"] = False
-            report["load_succeeded"] = False
+            report["post_load_validation_succeeded"] = False
+            report["text_backbone_config_mismatches"] = config_mismatches
             report["post_load_error"] = (
-                "my_model checkpoint/source expects the T5-large "
-                "1024-dimensional text backbone."
+                f"my_model requires canonical T5-large config; mismatches: "
+                f"{config_mismatches}"
             )
             report_path.write_text(
                 json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
@@ -209,6 +211,11 @@ def _preflight_my_coarse(
             return BackendPreflight(
                 "my_model_coarse", False, report_path, None
             )
+        report["post_load_validation_succeeded"] = True
+        report["text_backbone_config_mismatches"] = {}
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+        )
         return BackendPreflight("my_model_coarse", True, report_path, model)
     except Exception as error:
         if not report_path.exists():
