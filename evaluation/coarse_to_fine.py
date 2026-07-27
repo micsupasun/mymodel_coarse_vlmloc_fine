@@ -1,7 +1,9 @@
-"""Two-stage coarse-to-fine evaluation with a shared retrieval manifest.
+"""Coarse-to-fine evaluation with explicit, fail-closed protocols.
 
-Stage 1 runs only ``my_model`` coarse retrieval. Stage 2 consumes that exact
-manifest for every selected fine backend and never performs retrieval itself.
+The ``table8-preflight`` command audits CMMLoc Top-1 retrieval plus VLM-Loc
+fine localization.  The separate ``stage1``/``stage2`` commands implement the
+modified experiment: stage 1 runs only ``my_model`` coarse retrieval and stage
+2 consumes that exact manifest without retrieving again.
 """
 
 from __future__ import annotations
@@ -54,6 +56,13 @@ from evaluation.fine_backends import (
     t5_config_record,
     t5_config_mismatches,
     validate_sentence_preprocessing,
+)
+from evaluation.table8_reproduction import (
+    CMMLOC_SOURCE_COMMIT,
+    EXPECTED_THRESHOLDS_M as TABLE8_THRESHOLDS_M,
+    EXPECTED_TOP_K as TABLE8_TOP_K,
+    build_table8_preflight_report,
+    write_table8_preflight_report,
 )
 from evaluation.pipeline import rerank_candidate_cells, run_coarse
 from evaluation.utils import calc_sample_accuracies, print_accuracies
@@ -360,6 +369,11 @@ def _checkpoint_paths(cli: argparse.Namespace) -> dict[str, Path]:
             Path(cli.cmmloc_fine_checkpoint).resolve()
             if cli.cmmloc_fine_checkpoint
             else root / "CMMLoc" / "fine.pth"
+        ),
+        "cmmloc_coarse": (
+            Path(cli.cmmloc_coarse_checkpoint).resolve()
+            if cli.cmmloc_coarse_checkpoint
+            else root / "CMMLoc" / "coarse.pth"
         ),
         "mncl": (
             Path(cli.mncl_fine_checkpoint).resolve()
@@ -1013,6 +1027,86 @@ def command_preflight(cli: argparse.Namespace) -> int:
     return 0 if all(check.compatible for check in checks) else 2
 
 
+def command_table8_preflight(cli: argparse.Namespace) -> int:
+    """Audit only CMMLoc Top-1 -> VLM-Loc fine Table-8 reproduction."""
+
+    output_dir = Path(cli.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    args = _model_config(cli)
+    paths = _checkpoint_paths(cli)
+    seed_everything(cli.seed)
+    dataset = _load_test_dataset(args)
+    signature = dataset_signature(dataset)
+
+    vlmloc_dir = output_dir / "vlmloc_fine"
+    try:
+        vlmloc_check = preflight_vlmloc(
+            vlmloc_root=paths["vlmloc"],
+            report_dir=vlmloc_dir,
+            current_dataset_signature=signature,
+        )
+    except Exception as error:
+        vlmloc_report_path = vlmloc_dir / "vlmloc_checkpoint_audit.json"
+        _write_construction_error(
+            vlmloc_report_path, "vlmloc_table8_fine", error
+        )
+        vlmloc_check = BackendPreflight(
+            "vlmloc_table8_fine", False, vlmloc_report_path
+        )
+    vlmloc_report = json.loads(
+        vlmloc_check.report_path.read_text(encoding="utf-8")
+    )
+
+    checkpoint_root = Path(cli.checkpoint_root).resolve()
+    cmmloc_source_root = (
+        Path(cli.cmmloc_source_root).resolve()
+        if cli.cmmloc_source_root
+        else checkpoint_root
+        / "CMMLoc"
+        / "official_source"
+        / f"CMMLoc-{CMMLOC_SOURCE_COMMIT[:12]}"
+    )
+    report = build_table8_preflight_report(
+        data_root=Path(cli.data_root),
+        dataset_signature=signature,
+        cmmloc_coarse_checkpoint=paths["cmmloc_coarse"],
+        cmmloc_source_root=cmmloc_source_root,
+        vlmloc_report=vlmloc_report,
+        requested_text_backbone=cli.text_backbone,
+        split="test",
+        seed=cli.seed,
+        top_k=cli.top_k,
+        thresholds_m=cli.thresholds,
+    )
+    report_path = write_table8_preflight_report(
+        output_dir / "table8_step1_preflight.json", report
+    )
+    print("Table-8 step 1 protocol: CMMLoc coarse Top-1 -> VLM-Loc fine")
+    print(f"Dataset queries: {signature['query_count']} (Table 8: 11404)")
+    checkpoint_audit = report["cmmloc_coarse_checkpoint_audit"]
+    print(
+        "CMMLoc coarse official artifact: "
+        f"{'PASS' if checkpoint_audit.get('compatible_with_official_artifact') else 'FAIL'}"
+    )
+    print(
+        "CMMLoc coarse checkpoint/source architecture: "
+        f"{'PASS' if report['checks']['cmmloc_coarse_source_architecture'] else 'FAIL'}"
+    )
+    print(
+        "VLM-Loc Table-8 fine backend: "
+        f"{'PASS' if report['checks']['vlmloc_table8_fine_backend'] else 'FAIL'}"
+    )
+    print(f"Table-8 step 1 preflight: {report_path}")
+    if not report["all_compatible"]:
+        print(
+            "Inference was not started because the exact Table-8 protocol is "
+            "not fully reproducible from the audited artifacts.",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
 def command_stage1(cli: argparse.Namespace) -> int:
     validate_protocol_values(cli.top_k, cli.thresholds, cli.seed)
     output_dir = Path(cli.output_dir).resolve()
@@ -1224,8 +1318,17 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help="Exact local directory or Hugging Face identifier for the T5-large backbone.",
     )
     parser.add_argument("--my-coarse-checkpoint", default="")
+    parser.add_argument("--cmmloc-coarse-checkpoint", default="")
     parser.add_argument("--cmmloc-fine-checkpoint", default="")
     parser.add_argument("--mncl-fine-checkpoint", default="")
+    parser.add_argument(
+        "--cmmloc-source-root",
+        default="",
+        help=(
+            "Pinned official CMMLoc source root. If omitted, use "
+            "CHECKPOINT_ROOT/CMMLoc/official_source/CMMLoc-d49458963d4c."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
         "--top-k", type=int, nargs="+", default=list(REQUIRED_TOP_K)
@@ -1266,6 +1369,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=["vlmloc", "cmmloc", "mncl"],
     )
     preflight.set_defaults(handler=command_preflight)
+
+    table8_preflight = subparsers.add_parser(
+        "table8-preflight",
+        help=(
+            "Fail-closed audit for CMMLoc coarse Top-1 + VLM-Loc fine "
+            "(VLM-Loc Table 8)."
+        ),
+    )
+    _add_common_arguments(table8_preflight)
+    table8_preflight.set_defaults(
+        handler=command_table8_preflight,
+        top_k=list(TABLE8_TOP_K),
+        thresholds=list(TABLE8_THRESHOLDS_M),
+        coarse_rerank_mode="none",
+    )
+    table8_preflight.add_argument("--output-dir", required=True)
 
     stage1 = subparsers.add_parser("stage1")
     _add_common_arguments(stage1)
