@@ -148,7 +148,12 @@ semantic/instance keys that still exist in the published processed
 KITTI360Pose cells. The explicit compatibility flag below uses original
 processed points only for those proven-missing keys. It records every key,
 source cell and point count in the audit and uses a separate hybrid renderer
-cache; it never silently remaps an object to a different instance:
+cache; it never silently remaps an object to a different instance. If an
+exact raw key exists globally but its current archive has no points inside a
+published cell bbox, the same opt-in policy uses that cell's original
+processed cluster and records the cell-level reason. Each completed image has
+a `.render.json` sidecar so a restarted preparation can resume without
+recomputing completed cells:
 
 ```cmd
 python -m evaluation.coarse_to_fine table8-like-vlmloc-prepare --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --manifest "evaluation_outputs\table8_like_stage1_cmmloc\cmmloc_top1_manifest.json" --raw-kitti360-root "data\KITTI-360-raw" --require-dense-raw --allow-processed-missing-raw-fallback --output-dir "evaluation_outputs\table8_like_vlmloc_data_dense_raw"

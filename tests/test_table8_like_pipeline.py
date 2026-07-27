@@ -27,6 +27,7 @@ from evaluation.vlmloc_kitti360pose import (
     _pack_semantic_instance,
     _processed_fallback_objects,
     _query_message,
+    _render_cell_once,
     _source_tree_metadata_snapshot,
     audit_vlmloc_merged_checkpoint,
     evaluate_vlmloc_predictions,
@@ -514,6 +515,86 @@ class Table8LikePipelineTests(unittest.TestCase):
         self.assertEqual(
             image[first[1], first[0]].tolist(), [255, 0, 0]
         )
+
+    def test_dense_renderer_audits_empty_raw_cell_crop_fallback(self):
+        obj = SimpleNamespace(
+            id=6,
+            instance_id=13000,
+            label="fence",
+            xyz=np.asarray([[0.5, 0.5, 0.5]], dtype=np.float32),
+            rgb=np.asarray([[0.25, 0.5, 0.75]], dtype=np.float32),
+        )
+        cell = SimpleNamespace(
+            id="0000_1835",
+            objects=[obj],
+            bbox_w=np.asarray([0, 0, 0, 30, 30, 30]),
+            cell_size=30.0,
+        )
+        raw_objects = {
+            ("fence", 13000): (
+                np.asarray([[100, 100, 100]], dtype=np.float32),
+                np.asarray([[255, 255, 255]], dtype=np.uint8),
+            )
+        }
+        with self.assertRaisesRegex(RuntimeError, "has no points"):
+            render_dense_raw_cell(cell, raw_objects)
+        image, audit = render_dense_raw_cell(
+            cell,
+            raw_objects,
+            allow_processed_empty_crop_fallback=True,
+        )
+        self.assertEqual(audit["processed_cell_fallback_count"], 1)
+        self.assertEqual(
+            audit["processed_cell_fallbacks"][0]["reason"],
+            "raw_bbox_crop_empty",
+        )
+        x, y = normalized_xy_to_pixel([0.5, 0.5])
+        self.assertEqual(image[y, x].tolist(), [64, 128, 191])
+
+    def test_render_sidecar_resumes_without_recomputing(self):
+        root, directory = _temporary_directory()
+        try:
+            obj = SimpleNamespace(
+                id=1,
+                instance_id=17001,
+                label="pole",
+                xyz=np.asarray([[0.5, 0.5, 0.0]], dtype=np.float32),
+                rgb=np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+            )
+            cell = SimpleNamespace(
+                id="0000_00001",
+                scene_name="0000",
+                objects=[obj],
+                bbox_w=np.asarray([0, 0, 0, 30, 30, 30]),
+                cell_size=30.0,
+            )
+            first_path, first_info = _render_cell_once(
+                cell,
+                image_root=directory / "images",
+                overwrite=False,
+            )
+            with patch(
+                "evaluation.vlmloc_kitti360pose.render_processed_cell",
+                side_effect=RuntimeError("must not recompute"),
+            ):
+                second_path, second_info = _render_cell_once(
+                    cell,
+                    image_root=directory / "images",
+                    overwrite=False,
+                )
+            self.assertEqual(first_path, second_path)
+            self.assertEqual(first_info, second_info)
+            self.assertTrue(
+                first_path.with_name(
+                    f"{cell.id}.render.json"
+                ).is_file()
+            )
+        finally:
+            shutil.rmtree(directory)
+            try:
+                root.rmdir()
+            except OSError:
+                pass
 
     def test_partial_node_assignment_uses_public_distance_thresholds(self):
         pose = SimpleNamespace(

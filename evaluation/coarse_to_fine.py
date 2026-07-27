@@ -1488,6 +1488,14 @@ def command_table8_like_vlmloc_prepare(
         for scene in audit[split].get("raw_scene_audits", [])
     )
     print(f"Audited processed fallback object keys: {fallback_count}")
+    cell_fallback_count = sum(
+        audit[split].get("processed_cell_fallback_count", 0)
+        for split in ("training", "validation", "testing")
+    )
+    print(
+        "Audited per-cell processed fallbacks: "
+        f"{cell_fallback_count}"
+    )
     print(
         "KITTI360Pose source modified: "
         f"{audit['source_dataset_immutability']['source_dataset_modified']}; "

@@ -826,6 +826,7 @@ def render_dense_raw_cell(
     ],
     *,
     image_size: int = IMAGE_SIZE,
+    allow_processed_empty_crop_fallback: bool = False,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     bbox = np.asarray(cell.bbox_w, dtype=np.float64)
     image = np.full((image_size, image_size, 3), 255, dtype=np.uint8)
@@ -836,6 +837,7 @@ def render_dense_raw_cell(
         ).append(obj)
 
     object_raw: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    processed_cell_fallbacks: list[dict[str, Any]] = []
     for key, objects in object_groups.items():
         raw_xyz, raw_rgb = raw_scene_objects[key]
         label = key[0]
@@ -848,6 +850,37 @@ def render_dense_raw_cell(
             object_raw[id(objects[0])] = (raw_xyz, raw_rgb)
             continue
 
+        cropped_xyz, cropped_rgb = _crop_raw_points_to_bbox(
+            raw_xyz, raw_rgb, bbox
+        )
+        if not len(cropped_xyz):
+            if not allow_processed_empty_crop_fallback:
+                raise RuntimeError(
+                    f"Raw stuff object {key} has no points in cell {cell.id}"
+                )
+            for obj in objects:
+                normalized = np.asarray(obj.xyz, dtype=np.float64)
+                world = (
+                    normalized * float(cell.cell_size) + bbox[0:3]
+                ).astype(np.float32)
+                object_raw[id(obj)] = (
+                    world,
+                    _rgb_points_u8(obj.rgb),
+                )
+                processed_cell_fallbacks.append(
+                    {
+                        "cell_id": str(cell.id),
+                        "label": key[0],
+                        "instance_id": key[1],
+                        "object_id": str(obj.id),
+                        "reason": "raw_bbox_crop_empty",
+                        "source": (
+                            "original_processed_kitti360pose_cell_points"
+                        ),
+                        "point_count": len(world),
+                    }
+                )
+            continue
         try:
             from sklearn.neighbors import KDTree
         except ImportError as error:
@@ -856,14 +889,6 @@ def render_dense_raw_cell(
                 "nearest-cluster assignment used by the public source. Keep "
                 "NumPy pinned below 2 for the existing PyTorch/PyG binaries."
             ) from error
-
-        cropped_xyz, cropped_rgb = _crop_raw_points_to_bbox(
-            raw_xyz, raw_rgb, bbox
-        )
-        if not len(cropped_xyz):
-            raise RuntimeError(
-                f"Raw stuff object {key} has no points in cell {cell.id}"
-            )
         cluster_points = []
         cluster_ids = []
         for cluster_id, obj in enumerate(objects):
@@ -879,14 +904,37 @@ def render_dense_raw_cell(
         for cluster_id, obj in enumerate(objects):
             selected = assignments == cluster_id
             if not np.any(selected):
-                raise RuntimeError(
-                    f"Raw cluster mapping produced no points for object "
-                    f"{obj.id} in cell {cell.id}"
+                if not allow_processed_empty_crop_fallback:
+                    raise RuntimeError(
+                        f"Raw cluster mapping produced no points for object "
+                        f"{obj.id} in cell {cell.id}"
+                    )
+                normalized = np.asarray(obj.xyz, dtype=np.float64)
+                world = (
+                    normalized * float(cell.cell_size) + bbox[0:3]
+                ).astype(np.float32)
+                object_raw[id(obj)] = (
+                    world,
+                    _rgb_points_u8(obj.rgb),
                 )
-            object_raw[id(obj)] = (
-                cropped_xyz[selected],
-                cropped_rgb[selected],
-            )
+                processed_cell_fallbacks.append(
+                    {
+                        "cell_id": str(cell.id),
+                        "label": key[0],
+                        "instance_id": key[1],
+                        "object_id": str(obj.id),
+                        "reason": "raw_nearest_cluster_assignment_empty",
+                        "source": (
+                            "original_processed_kitti360pose_cell_points"
+                        ),
+                        "point_count": len(world),
+                    }
+                )
+            else:
+                object_raw[id(obj)] = (
+                    cropped_xyz[selected],
+                    cropped_rgb[selected],
+                )
 
     entries = []
     dense_point_count = 0
@@ -942,6 +990,10 @@ def render_dense_raw_cell(
         "rendered_object_count": len(entries),
         "dense_raw_point_count": dense_point_count,
         "raw_object_key_count": len(object_groups),
+        "processed_cell_fallback_count": len(
+            processed_cell_fallbacks
+        ),
+        "processed_cell_fallbacks": processed_cell_fallbacks,
     }
 
 
@@ -1092,18 +1144,48 @@ def _render_cell_once(
     ]
     | None = None,
     renderer_name: str | None = None,
+    allow_processed_cell_fallback: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
     scene_dir = image_root / str(cell.scene_name)
     scene_dir.mkdir(parents=True, exist_ok=True)
     image_path = scene_dir / f"{cell.id}.png"
+    cache_path = scene_dir / f"{cell.id}.render.json"
+    selected_renderer = renderer_name or (
+        DENSE_RAW_RENDERER_NAME
+        if raw_scene_objects is not None
+        else RENDERER_NAME
+    )
+    if (
+        not overwrite
+        and image_path.is_file()
+        and cache_path.is_file()
+    ):
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if (
+            cached.get("schema_version") == 1
+            and cached.get("cell_id") == str(cell.id)
+            and cached.get("renderer") == selected_renderer
+            and cached.get("image_size_px") == IMAGE_SIZE
+            and isinstance(cached.get("render_info"), dict)
+        ):
+            with Image.open(image_path) as existing:
+                if existing.size != (IMAGE_SIZE, IMAGE_SIZE):
+                    raise RuntimeError(
+                        f"cached image has wrong size: {image_path}"
+                    )
+            return image_path, cached["render_info"]
     if raw_scene_objects is None:
         image, info = render_processed_cell(cell)
-        info["renderer"] = renderer_name or RENDERER_NAME
+        info["renderer"] = selected_renderer
     else:
         image, info = render_dense_raw_cell(
-            cell, raw_scene_objects
+            cell,
+            raw_scene_objects,
+            allow_processed_empty_crop_fallback=(
+                allow_processed_cell_fallback
+            ),
         )
-        info["renderer"] = renderer_name or DENSE_RAW_RENDERER_NAME
+        info["renderer"] = selected_renderer
     if overwrite or not image_path.is_file():
         Image.fromarray(image, mode="RGB").save(image_path)
     else:
@@ -1112,6 +1194,16 @@ def _render_cell_once(
                 raise RuntimeError(
                     f"cached image has wrong size: {image_path}"
                 )
+    _write_json_atomic(
+        cache_path,
+        {
+            "schema_version": 1,
+            "cell_id": str(cell.id),
+            "renderer": selected_renderer,
+            "image_size_px": IMAGE_SIZE,
+            "render_info": info,
+        },
+    )
     return image_path, info
 
 
@@ -1140,6 +1232,7 @@ def _prepare_gt_split(
     cell_count = 0
     sample_index = 0
     raw_scene_audits = []
+    processed_cell_fallbacks: list[dict[str, Any]] = []
     # Keep only one scene's point arrays in memory at a time. The JSON sample
     # order remains the declared split order.
     for scene in scenes:
@@ -1172,13 +1265,27 @@ def _prepare_gt_split(
         rendered: dict[str, tuple[Path, dict[str, Any]]] = {}
         render_started = time.perf_counter()
         for cell_index, cell in enumerate(dataset.all_cells, start=1):
-            rendered[str(cell.id)] = _render_cell_once(
+            render_result = _render_cell_once(
                 cell,
                 image_root=image_root,
                 overwrite=overwrite_images,
                 raw_scene_objects=raw_scene_objects,
                 renderer_name=renderer_name,
+                allow_processed_cell_fallback=(
+                    allow_processed_missing_raw_fallback
+                ),
             )
+            rendered[str(cell.id)] = render_result
+            cell_fallbacks = render_result[1].get(
+                "processed_cell_fallbacks", []
+            )
+            if cell_fallbacks:
+                processed_cell_fallbacks.extend(cell_fallbacks)
+                print(
+                    f"Audited per-cell processed fallback: "
+                    f"cell={cell.id}, count={len(cell_fallbacks)}",
+                    flush=True,
+                )
             if (
                 cell_index == 1
                 or cell_index % 100 == 0
@@ -1226,6 +1333,10 @@ def _prepare_gt_split(
         "dataset_json_path": str(json_path.resolve()),
         "dataset_json_sha256": _sha256_file(json_path),
         "raw_scene_audits": raw_scene_audits,
+        "processed_cell_fallback_count": len(
+            processed_cell_fallbacks
+        ),
+        "processed_cell_fallbacks": processed_cell_fallbacks,
     }
     return json_path, stats
 
@@ -1333,6 +1444,7 @@ def prepare_vlmloc_data(
     )
     rendered = {}
     testing_raw_scene_audits = []
+    testing_processed_cell_fallbacks: list[dict[str, Any]] = []
     for scene in SCENE_NAMES_TEST:
         print(
             "Preparing VLM inputs: split=testing_cmmloc_top1, "
@@ -1369,13 +1481,27 @@ def prepare_vlmloc_data(
             )
         render_started = time.perf_counter()
         for cell_index, cell_id in enumerate(scene_cell_ids, start=1):
-            rendered[cell_id] = _render_cell_once(
+            render_result = _render_cell_once(
                 cells[cell_id],
                 image_root=image_root,
                 overwrite=overwrite_images,
                 raw_scene_objects=raw_scene_objects,
                 renderer_name=selected_renderer_name,
+                allow_processed_cell_fallback=(
+                    allow_processed_missing_raw_fallback
+                ),
             )
+            rendered[cell_id] = render_result
+            cell_fallbacks = render_result[1].get(
+                "processed_cell_fallbacks", []
+            )
+            if cell_fallbacks:
+                testing_processed_cell_fallbacks.extend(cell_fallbacks)
+                print(
+                    f"Audited per-cell processed fallback: "
+                    f"cell={cell_id}, count={len(cell_fallbacks)}",
+                    flush=True,
+                )
             if (
                 cell_index == 1
                 or cell_index % 100 == 0
@@ -1500,6 +1626,12 @@ def prepare_vlmloc_data(
             "smoke_dataset_sha256": _sha256_file(smoke_path),
             "ordered_dataset_signature": signature,
             "raw_scene_audits": testing_raw_scene_audits,
+            "processed_cell_fallback_count": len(
+                testing_processed_cell_fallbacks
+            ),
+            "processed_cell_fallbacks": (
+                testing_processed_cell_fallbacks
+            ),
         },
         "cmmloc_manifest_path": str(Path(manifest_path).resolve()),
         "cmmloc_manifest_sha256": _sha256_file(Path(manifest_path)),
