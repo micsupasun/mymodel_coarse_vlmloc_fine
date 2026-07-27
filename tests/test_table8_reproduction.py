@@ -155,6 +155,41 @@ class Table8ReproductionTests(unittest.TestCase):
         self.assertNotIn("dataset", blocker_names)
         self.assertIn("vlmloc_table8_fine_backend", blocker_names)
 
+    def test_full_test_can_use_only_explicit_cmmloc_release_behavior(
+        self,
+    ) -> None:
+        release_runtime = {
+            "compatible": True,
+            "public_release_inference_behavior_claimed": True,
+            "exact_training_architecture_claimed": False,
+            "allowed_unexpected_keys": [f"cell_encoder2.{i}" for i in range(130)]
+            + [f"obj_inter_module.{i}" for i in range(24)]
+            + ["modular_vector_mapping.weight"],
+            "forbidden_unexpected_keys": [],
+            "shape_mismatches": [],
+        }
+        with workspace_temp_directory() as root:
+            report = build_table8_preflight_report(
+                data_root=root / "k360_30-10_scG_pd10_pc4_spY_all",
+                dataset_signature=_signature(11_505),
+                cmmloc_coarse_checkpoint=root / "coarse.pth",
+                cmmloc_source_root=root / "source",
+                vlmloc_report={"compatible": False},
+                cmmloc_release_runtime_report=release_runtime,
+                allow_public_release_behavior=True,
+                require_exact_paper_count=False,
+            )
+        self.assertTrue(
+            report["checks"]["cmmloc_coarse_source_architecture"]
+        )
+        self.assertTrue(
+            report["checks"]["cmmloc_text_pointnet_preprocessing"]
+        )
+        self.assertTrue(
+            report["safety"]["strict_false_after_exact_mismatch_audit"]
+        )
+        self.assertFalse(report["all_compatible"])
+
     def test_local_cmmloc_checkpoint_matches_official_artifact_when_present(
         self,
     ) -> None:

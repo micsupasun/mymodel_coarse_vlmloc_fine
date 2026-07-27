@@ -21,6 +21,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from evaluation.vlmloc_release import (
+    BASE_MODEL_REVISION_MARKER,
     DEFAULT_BASE_MODEL_RELATIVE,
     DEFAULT_OFFICIAL_SOURCE_RELATIVE,
     OFFICIAL_HF_DATASET,
@@ -128,23 +129,37 @@ def _download_public_adapter(vlmloc_root: Path) -> Path:
 
 def _download_base_model(vlmloc_root: Path) -> Path:
     target = vlmloc_root / DEFAULT_BASE_MODEL_RELATIVE
+    revision_marker = target / BASE_MODEL_REVISION_MARKER
     if (target / "config.json").is_file() and (
         target / "model.safetensors.index.json"
-    ).is_file():
+    ).is_file() and revision_marker.is_file():
         print(f"Qwen3-VL-8B base model already exists: {target}")
         return target
+    if target.exists() and any(target.iterdir()):
+        raise RuntimeError(
+            "Refusing to stamp or overwrite a pre-existing Qwen base-model "
+            f"directory without an immutable revision marker: {target}. "
+            "Move it aside and rerun, or audit it manually."
+        )
     _require_free_space(target, MIN_FREE_BYTES_FOR_BASE_MODEL, QWEN3_VL_8B_MODEL_ID)
     try:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import HfApi, snapshot_download
     except ImportError as error:
         raise RuntimeError(
             "huggingface_hub is required. Install it in the GPU environment "
             "with: python -m pip install huggingface_hub"
         ) from error
 
+    resolved_revision = HfApi().model_info(QWEN3_VL_8B_MODEL_ID).sha
+    if not resolved_revision:
+        raise RuntimeError(
+            f"Could not resolve an immutable revision for "
+            f"{QWEN3_VL_8B_MODEL_ID}."
+        )
     target.mkdir(parents=True, exist_ok=True)
     snapshot_download(
         repo_id=QWEN3_VL_8B_MODEL_ID,
+        revision=resolved_revision,
         local_dir=str(target),
         allow_patterns=[
             "*.json",
@@ -152,6 +167,9 @@ def _download_base_model(vlmloc_root: Path) -> Path:
             "*.safetensors",
             "*.model",
         ],
+    )
+    revision_marker.write_text(
+        resolved_revision + "\n", encoding="utf-8"
     )
     return target
 
@@ -232,6 +250,17 @@ def _audit(vlmloc_root: Path) -> dict[str, Any]:
         and report["official_source"].get("source_commit_matches")
         and not report["official_source"].get("missing_required_source_files")
     )
+    report["table8_like_retraining_assets_ready"] = bool(
+        report["base_model"].get("architecture_matches_qwen3_vl_8b")
+        and not report["base_model"].get(
+            "missing_base_shards", ["unknown"]
+        )
+        and report["base_model"].get("revision_marker_exists")
+        and report["official_source"].get("source_commit_matches")
+        and not report["official_source"].get(
+            "missing_required_source_files"
+        )
+    )
     report["requested_table8_assets_ready"] = bool(
         report["public_assets_ready"]
         and report["table8_adapter_present"]
@@ -259,6 +288,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-base-model", action="store_true")
     parser.add_argument("--skip-public-adapter", action="store_true")
     parser.add_argument("--skip-official-source", action="store_true")
+    parser.add_argument(
+        "--table8-like-retraining",
+        action="store_true",
+        help=(
+            "Download/audit only the pinned source and immutable Qwen base "
+            "needed to retrain on local KITTI360Pose 30 m data. The CityLoc "
+            "public adapter is skipped."
+        ),
+    )
     return parser
 
 
@@ -275,7 +313,7 @@ def main() -> int:
         if not cli.audit_only:
             if not cli.skip_official_source:
                 _download_official_source(vlmloc_root)
-            if not cli.skip_public_adapter:
+            if not cli.skip_public_adapter and not cli.table8_like_retraining:
                 _download_public_adapter(vlmloc_root)
             if not cli.skip_base_model:
                 _download_base_model(vlmloc_root)
@@ -294,9 +332,18 @@ def main() -> int:
         "requested_table8_assets_ready="
         f"{report['requested_table8_assets_ready']}"
     )
+    print(
+        "table8_like_retraining_assets_ready="
+        f"{report['table8_like_retraining_assets_ready']}"
+    )
     if error:
         print(error, file=sys.stderr)
         return 1
+    if (
+        cli.table8_like_retraining
+        and report["table8_like_retraining_assets_ready"]
+    ):
+        return 0
     if not report["requested_table8_assets_ready"]:
         print(
             "Public downloads completed/audited, but the requested Table-8 "

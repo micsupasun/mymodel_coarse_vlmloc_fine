@@ -364,11 +364,13 @@ def preflight_vlmloc(
             f"Pinned official VLM-Loc source commit {OFFICIAL_SOURCE_COMMIT} "
             "has not been downloaded and marked."
         )
-    # Even complete files are not enough until the exact fine runner is present.
-    missing_keys.append(
-        "This repository has no validated Qwen3-VL generation/parser runner "
-        "that consumes every candidate from the shared retrieval manifest."
+    table8_like_runner_exists = (
+        Path(__file__).with_name("vlmloc_kitti360pose.py").is_file()
     )
+    if not table8_like_runner_exists:
+        missing_keys.append(
+            "The validated Qwen3-VL preparation/world-metric runner is absent."
+        )
     unexpected_keys = []
     if public_adapter_is_cityloc:
         unexpected_keys.append(
@@ -410,6 +412,9 @@ def preflight_vlmloc(
         "python_environment_audit": inspect_python_environment(),
         "public_adapter_quarantined_as_cityloc": public_adapter_is_cityloc,
         "exact_assets_compatible_before_runner_check": exact_assets_compatible,
+        "table8_like_preparation_and_world_metric_runner_exists": (
+            table8_like_runner_exists
+        ),
         "shape_comparison_to_base_attempted": bool(
             exact_adapter_files_exist
             and base_model.get("architecture_matches_qwen3_vl_8b")
@@ -431,7 +436,9 @@ def preflight_vlmloc(
             "VLM-Loc was separately retrained on KITTI360Pose, but that exact "
             "30 m adapter/provenance is not in the public release. The public "
             "adapter is therefore not substituted and is never loaded into "
-            "CrossMatch or any other architecture."
+            "CrossMatch or any other architecture. The Table-8-like path "
+            "requires local 30 m data generation, retraining, and a one-query "
+            "runtime load/generation smoke before full inference."
         ),
         "source_reference": (
             "https://github.com/MCG-NKU/nku-3d-vision/tree/main/vlm-loc"

@@ -479,6 +479,8 @@ def build_table8_preflight_report(
     cmmloc_coarse_checkpoint: Path,
     cmmloc_source_root: Path,
     vlmloc_report: Mapping[str, Any],
+    cmmloc_release_runtime_report: Mapping[str, Any] | None = None,
+    allow_public_release_behavior: bool = False,
     requested_text_backbone: str = "t5-large",
     require_exact_paper_count: bool = True,
     split: str = EXPECTED_SPLIT,
@@ -506,21 +508,52 @@ def build_table8_preflight_report(
     )
 
     vlmloc_compatible = bool(vlmloc_report.get("compatible"))
+    cmmloc_release_compatible = bool(
+        allow_public_release_behavior
+        and cmmloc_release_runtime_report
+        and cmmloc_release_runtime_report.get("compatible")
+        and cmmloc_release_runtime_report.get(
+            "public_release_inference_behavior_claimed"
+        )
+        and not cmmloc_release_runtime_report.get(
+            "exact_training_architecture_claimed", True
+        )
+    )
     checks = {
         "protocol": protocol["compatible"],
         "dataset": dataset["compatible"],
         "cmmloc_coarse_official_artifact": checkpoint[
             "compatible_with_official_artifact"
         ],
-        "cmmloc_coarse_source_architecture": checkpoint[
-            "compatible_with_public_source"
-        ]
-        and source["compatible"],
-        "cmmloc_text_pointnet_preprocessing": configuration["compatible"],
+        "cmmloc_coarse_source_architecture": (
+            cmmloc_release_compatible
+            if allow_public_release_behavior
+            else checkpoint["compatible_with_public_source"]
+            and source["compatible"]
+        ),
+        "cmmloc_text_pointnet_preprocessing": (
+            cmmloc_release_compatible
+            if allow_public_release_behavior
+            else configuration["compatible"]
+        ),
         "vlmloc_table8_fine_backend": vlmloc_compatible,
     }
     blockers = []
     warnings = list(dataset.get("warnings", []))
+    if allow_public_release_behavior:
+        warnings.append(
+            {
+                "field": "cmmloc_release_architecture",
+                "effect": (
+                    "This full-test protocol reproduces the pinned public "
+                    "CMMLoc inference constructor. It explicitly reports and "
+                    "ignores exactly 155 checkpoint-only tensors, matching "
+                    "the public evaluation behavior. It does not claim that "
+                    "the unpublished training constructor was recovered."
+                ),
+                "ignored_prefix_counts": CMMLOC_CHECKPOINT_ONLY_PREFIX_COUNTS,
+            }
+        )
     if not checks["protocol"]:
         blockers.append(
             {"check": "protocol", "details": protocol["mismatches"]}
@@ -540,22 +573,30 @@ def build_table8_preflight_report(
         blockers.append(
             {
                 "check": "cmmloc_coarse_source_architecture",
-                "details": {
-                    "unexpected_key_count": checkpoint.get(
-                        "unexpected_key_count", 0
-                    ),
-                    "unexpected_prefix_counts": checkpoint.get(
-                        "unexpected_prefix_counts", {}
-                    ),
-                    "source_reason": source.get("reason"),
-                },
+                "details": (
+                    dict(cmmloc_release_runtime_report or {})
+                    if allow_public_release_behavior
+                    else {
+                        "unexpected_key_count": checkpoint.get(
+                            "unexpected_key_count", 0
+                        ),
+                        "unexpected_prefix_counts": checkpoint.get(
+                            "unexpected_prefix_counts", {}
+                        ),
+                        "source_reason": source.get("reason"),
+                    }
+                ),
             }
         )
     if not checks["cmmloc_text_pointnet_preprocessing"]:
         blockers.append(
             {
                 "check": "cmmloc_text_pointnet_preprocessing",
-                "details": configuration,
+                "details": (
+                    dict(cmmloc_release_runtime_report or {})
+                    if allow_public_release_behavior
+                    else configuration
+                ),
             }
         )
     if not checks["vlmloc_table8_fine_backend"]:
@@ -595,6 +636,11 @@ def build_table8_preflight_report(
         "cmmloc_coarse_checkpoint_audit": checkpoint,
         "cmmloc_public_source_audit": source,
         "cmmloc_runtime_configuration_audit": configuration,
+        "cmmloc_release_runtime_audit": (
+            dict(cmmloc_release_runtime_report)
+            if cmmloc_release_runtime_report is not None
+            else None
+        ),
         "vlmloc_fine_audit": dict(vlmloc_report),
         "checks": checks,
         "all_compatible": all(checks.values()),
@@ -604,7 +650,12 @@ def build_table8_preflight_report(
         "safety": {
             "my_model_used": False,
             "retrieval_top_k": 1,
-            "strict_false_used_by_this_preflight": False,
+            "strict_false_used_by_this_preflight": bool(
+                cmmloc_release_compatible
+            ),
+            "strict_false_after_exact_mismatch_audit": bool(
+                cmmloc_release_compatible
+            ),
             "cross_architecture_checkpoint_load_attempted": False,
             "coarse_inference_attempted": False,
             "fine_inference_attempted": False,

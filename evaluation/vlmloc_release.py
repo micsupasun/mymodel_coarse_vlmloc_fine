@@ -34,6 +34,7 @@ DEFAULT_BASE_MODEL_RELATIVE = Path("base_models/Qwen3-VL-8B-Instruct")
 DEFAULT_OFFICIAL_SOURCE_RELATIVE = Path(
     f"official_source/nku-3d-vision-{OFFICIAL_SOURCE_COMMIT[:12]}"
 )
+BASE_MODEL_REVISION_MARKER = ".huggingface_model_revision"
 
 EXPECTED_DATASET_TOKEN = "k360_30-10_scG_pd10_pc4_spY_all"
 EXPECTED_TEST_SCENES = (
@@ -169,7 +170,11 @@ def inspect_adapter(adapter_dir: Path) -> dict[str, Any]:
         record.update(
             {
                 "training_model": args.get("model"),
+                "training_model_type": args.get("model_type"),
                 "training_template": args.get("template"),
+                "training_type": (
+                    args.get("train_type") or args.get("tuner_type")
+                ),
                 "training_datasets": args.get("dataset"),
                 "validation_datasets": args.get("val_dataset"),
                 "training_dataset_tokens": dataset_tokens(
@@ -181,6 +186,14 @@ def inspect_adapter(adapter_dir: Path) -> dict[str, Any]:
                 "training_seed": args.get("seed"),
                 "data_seed": args.get("data_seed"),
                 "torch_dtype": args.get("torch_dtype"),
+                "training_target_modules": args.get("target_modules"),
+                "training_freeze_vit": args.get("freeze_vit"),
+                "training_freeze_aligner": args.get("freeze_aligner"),
+                "training_num_epochs": args.get("num_train_epochs"),
+                "training_learning_rate": args.get("learning_rate"),
+                "training_gradient_accumulation_steps": args.get(
+                    "gradient_accumulation_steps"
+                ),
                 "args_sha256": sha256_file(args_path),
             }
         )
@@ -277,10 +290,18 @@ def inspect_base_model(base_model_dir: Path) -> dict[str, Any]:
     base_model_dir = Path(base_model_dir).resolve()
     config_path = base_model_dir / "config.json"
     index_path = base_model_dir / "model.safetensors.index.json"
+    revision_path = base_model_dir / BASE_MODEL_REVISION_MARKER
     record: dict[str, Any] = {
         "base_model_dir": str(base_model_dir),
         "config_exists": config_path.is_file(),
         "safetensors_index_exists": index_path.is_file(),
+        "revision_marker_path": str(revision_path),
+        "revision_marker_exists": revision_path.is_file(),
+        "resolved_model_revision": (
+            revision_path.read_text(encoding="utf-8").strip()
+            if revision_path.is_file()
+            else None
+        ),
     }
     if config_path.is_file():
         config = json.loads(config_path.read_text(encoding="utf-8"))

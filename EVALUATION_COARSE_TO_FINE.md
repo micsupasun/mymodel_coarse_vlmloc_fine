@@ -41,43 +41,120 @@ Then run the dedicated full-test fail-closed preflight:
 python -m evaluation.coarse_to_fine table8-like-preflight --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --device "cuda:0" --output-dir "evaluation_outputs\table8_like_full_test_preflight"
 ```
 
-Both commands currently return exit code 2 after writing their JSON audit.
-That result is expected from the public artifacts currently available; it is
-not caused by the 11,505-query count and is not an instruction to bypass the
-remaining model checks. Inference is not exposed until every required model
-check passes.
+The full-test preflight constructs a separate
+`CMMLocReleaseCoarseNetwork`. It reproduces the pinned public inference
+constructor and permits only the exactly enumerated 155 checkpoint-only
+tensors (`cell_encoder2`: 130, `obj_inter_module`: 24,
+`modular_vector_mapping`: 1). Every key is written to the audit and the return
+value of `load_state_dict` is asserted against that list. This is labelled
+**public-release inference behavior**, not recovery of the unpublished
+training constructor.
 
-Confirmed blockers:
+The release records only `PATH_TO_T5`, not an immutable T5 revision. The
+runtime audit therefore verifies the canonical T5-large configuration and
+1,024-dimensional checkpoint projection but retains the missing revision as a
+scope warning. PointNet tensors, by contrast, are fully supplied and
+shape-checked from the enclosing coarse checkpoint.
 
-1. The local `CMMLoc/coarse.pth` is byte-for-byte the official 118,308,613-byte
-   file (SHA-256
-   `5e14e158c3de1fc046d9b970ef1d06c6d4a98d55a1cfdd09f6d26dfc23076f85`).
-   However, the pinned official constructor has no `cell_encoder2`,
-   `obj_inter_module`, or `modular_vector_mapping`, totaling 155 checkpoint
-   keys. The official evaluation script hides these as unexpected keys with
-   `strict=False`; this pipeline reports them and refuses to guess the training
-   architecture.
-2. The local ordered test split has 11,505 queries, while Table 8 reports
-   11,404. In the requested full-test mode this is an accepted warning, not a
-   blocker. The ordered query/cell fingerprints are still written to the
-   audit.
-3. The downloadable VLM-Loc adapter/test assets are CityLoc-K/50 m artifacts.
-   Table 8 states that VLM-Loc was separately retrained on KITTI360Pose, but
-   that exact 30 m adapter, training provenance, and 11,404-item prepared test
-   set are not in the public release.
-4. The CMMLoc checkpoint tensors support a 1,024-dimensional T5-large family
-   and the source exposes NLTK sentence splitting plus `FixedPoints(256)` and
-   PointNet defaults. The release nevertheless records only `PATH_TO_T5` and
-   `PATH_TO_POINTNET`, not the exact text-model revision or PointNet artifact
-   provenance. The preflight reports these fields as unresolved.
+Before local VLM-Loc retraining, the command still returns exit code 2 because
+the public VLM adapter is CityLoc-K/50 m. A CMMLoc PASS and VLM-Loc FAIL at
+this point is expected and is not a reason to rerun the same preflight. The
+11,505-query count is already accepted.
 
-The setup command downloads the pinned CMMLoc/VLM-Loc source and the official
-CMMLoc coarse checkpoint if missing. It deliberately does not spend roughly
-18+ GB downloading the CityLoc adapter/base-model combination, because those
-files cannot satisfy the Table-8 preflight.
+### Step 1A: CMMLoc coarse Top-1
 
-The two output directories above are separate. No stage-1 retrieval manifest
-or fine predictions are written while step 1 is blocked.
+This output directory contains only coarse results and the exact Top-1
+manifest:
+
+```cmd
+python -m evaluation.coarse_to_fine table8-like-stage1 --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --batch-size 16 --device "cuda:0" --output-dir "evaluation_outputs\table8_like_stage1_cmmloc"
+```
+
+`cmmloc_coarse_metrics.json` is a coarse diagnostic, not the VLM-Loc fine
+result. The candidate hand-off is `cmmloc_top1_manifest.json`.
+
+### Step 1B: create separate KITTI360Pose 30 m VLM data
+
+The public VLM renderer used dense raw points, but the local processed folder
+contains only normalized downsampled cell points. The following command uses
+those points consistently for train, validation, and test and records that
+deviation. The VLM adapter must be retrained on these exact images.
+
+```cmd
+python -m evaluation.coarse_to_fine table8-like-vlmloc-prepare --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --manifest "evaluation_outputs\table8_like_stage1_cmmloc\cmmloc_top1_manifest.json" --output-dir "evaluation_outputs\table8_like_vlmloc_data"
+```
+
+The testing JSON contains exactly 11,505 samples in manifest order. The
+sidecar `vlmloc_testing_index.json` retains each candidate bbox and true world
+pose so the final metric is computed in metres, not merely as pixel error.
+
+### Step 1C: download Qwen and retrain VLM-Loc
+
+Use a separate VLM environment so `ms-swift` does not alter the working
+CMMLoc/PyG environment:
+
+```cmd
+conda create -n vlmloc_qwen python=3.11 -y
+```
+
+```cmd
+conda activate vlmloc_qwen
+```
+
+```cmd
+python -m pip install -U "ms-swift[llm]" pillow huggingface_hub
+```
+
+Download the complete Qwen3-VL-8B base at a resolved immutable revision and
+audit the pinned VLM-Loc source. The CityLoc adapter is skipped:
+
+```cmd
+python scripts\setup_vlmloc_gpu.py --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --output-dir "evaluation_outputs\table8_like_vlmloc_setup" --table8-like-retraining
+```
+
+Train with the public VLM-Loc LoRA settings:
+
+```cmd
+set CUDA_VISIBLE_DEVICES=0&& set NCCL_P2P_DISABLE=1&& set NCCL_IB_DISABLE=1&& swift sft --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\base_models\Qwen3-VL-8B-Instruct" --dataset "evaluation_outputs\table8_like_vlmloc_data\vlmloc_training_data.json" --val_dataset "evaluation_outputs\table8_like_vlmloc_data\vlmloc_validation_data.json" --tuner_type lora --torch_dtype bfloat16 --num_train_epochs 5 --per_device_train_batch_size 1 --per_device_eval_batch_size 1 --learning_rate 1e-4 --lora_rank 8 --lora_alpha 16 --target_modules all-linear --freeze_vit false --freeze_aligner false --gradient_accumulation_steps 2 --eval_steps 300 --save_steps 300 --warmup_ratio 0.05 --dataloader_num_workers 4 --dataset_num_proc 1 --save_total_limit 5 --gradient_checkpointing true --seed 42 --data_seed 42 --add_version false --output_dir "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs"
+```
+
+Select the saved `checkpoint-N` with the lowest validation loss. Do not assume
+that a CityLoc checkpoint number, such as 3600, is correct for this dataset.
+
+### Step 1D: one-query VLM runtime preflight
+
+Replace `<checkpoint-N>` with that selected checkpoint. Use a fresh result
+path because `swift infer` appends to an existing JSONL:
+
+```cmd
+set CUDA_VISIBLE_DEVICES=0&& swift infer --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\base_models\Qwen3-VL-8B-Instruct" --adapters "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs\checkpoint-N" --infer_backend transformers --val_dataset "evaluation_outputs\table8_like_vlmloc_data\vlmloc_testing_smoke_1.json" --val_dataset_sample 1 --dataset_shuffle false --max_new_tokens 512 --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --result_path "evaluation_outputs\table8_like_stage2_vlmloc_preflight\smoke_predictions.jsonl"
+```
+
+Audit the data hashes, LoRA keys/internal shapes, base shards/revision, source
+and environment, and actual one-query load/generation:
+
+```cmd
+python -m evaluation.coarse_to_fine table8-like-vlmloc-preflight --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --adapter-dir "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs\checkpoint-N" --vlmloc-data-dir "evaluation_outputs\table8_like_vlmloc_data" --smoke-predictions "evaluation_outputs\table8_like_stage2_vlmloc_preflight\smoke_predictions.jsonl" --output-dir "evaluation_outputs\table8_like_stage2_vlmloc_preflight"
+```
+
+Do not start full inference unless all five checks print PASS.
+
+### Step 1E: full VLM fine inference and metric
+
+The fine output directory is separate from CMMLoc Stage 1:
+
+```cmd
+set CUDA_VISIBLE_DEVICES=0&& swift infer --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\base_models\Qwen3-VL-8B-Instruct" --adapters "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs\checkpoint-N" --infer_backend transformers --val_dataset "evaluation_outputs\table8_like_vlmloc_data\vlmloc_testing_data.json" --dataset_shuffle false --max_batch_size 1 --max_new_tokens 512 --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --result_path "evaluation_outputs\table8_like_stage2_vlmloc\predictions.jsonl"
+```
+
+Score every prediction in the world frame of its exact CMMLoc candidate;
+malformed outputs count as misses:
+
+```cmd
+python -m evaluation.coarse_to_fine table8-like-vlmloc-evaluate --predictions "evaluation_outputs\table8_like_stage2_vlmloc\predictions.jsonl" --test-index "evaluation_outputs\table8_like_vlmloc_data\vlmloc_testing_index.json" --output-dir "evaluation_outputs\table8_like_stage2_vlmloc"
+```
+
+The fine stage never retrieves again or replaces the Stage-1 candidate.
 
 ## Modified shared-`my_model` evaluation
 

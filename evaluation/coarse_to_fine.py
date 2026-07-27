@@ -34,6 +34,12 @@ from datapreparation.kitti360pose.utils import (
     SCENE_NAMES_TEST,
 )
 from evaluation.checkpoint_loading import audit_and_load_checkpoint
+from evaluation.cmmloc_release import (
+    CMMLOC_RELEASE_IGNORED_KEY_COUNT,
+    CMMLOC_RELEASE_IGNORED_PREFIX_COUNTS,
+    CMMLOC_RELEASE_IGNORED_PREFIXES,
+    CMMLocReleaseCoarseNetwork,
+)
 from evaluation.coarse_to_fine_protocol import (
     DEFAULT_SEED,
     REQUIRED_TEST_SCENES,
@@ -61,8 +67,16 @@ from evaluation.table8_reproduction import (
     CMMLOC_SOURCE_COMMIT,
     EXPECTED_THRESHOLDS_M as TABLE8_THRESHOLDS_M,
     EXPECTED_TOP_K as TABLE8_TOP_K,
+    audit_cmmloc_coarse_checkpoint,
+    audit_cmmloc_public_source,
     build_table8_preflight_report,
     write_table8_preflight_report,
+)
+from evaluation.table8_like_protocol import write_table8_like_manifest
+from evaluation.vlmloc_kitti360pose import (
+    audit_vlmloc_runtime_preflight,
+    evaluate_vlmloc_predictions,
+    prepare_vlmloc_data,
 )
 from evaluation.pipeline import rerank_candidate_cells, run_coarse
 from evaluation.utils import calc_sample_accuracies, print_accuracies
@@ -355,6 +369,165 @@ def _preflight_my_coarse(
                 encoding="utf-8",
             )
         return BackendPreflight("my_model_coarse", False, report_path)
+
+
+def _cmmloc_release_config(args: ModelConfig) -> ModelConfig:
+    """Return a non-reranked Top-1 config for the public CMMLoc backend."""
+
+    release_args = ModelConfig(args)
+    release_args.top_k = [1]
+    release_args.threshs = list(TABLE8_THRESHOLDS_M)
+    release_args.coarse_rerank_mode = "none"
+    release_args.rerank_topn = 0
+    release_args.trainable_rerank_topn = 0
+    release_args.use_model_reranker = False
+    release_args.use_trainable_reranker = False
+    return release_args
+
+
+def _preflight_cmmloc_release_coarse(
+    *,
+    args: ModelConfig,
+    checkpoint_path: Path,
+    source_root: Path,
+    report_dir: Path,
+) -> BackendPreflight:
+    """Load the pinned public constructor with an explicit 155-key allowlist."""
+
+    report_path = (
+        report_dir / "cmmloc_release_coarse_checkpoint_audit.json"
+    ).resolve()
+    release_args = _cmmloc_release_config(args)
+    try:
+        source_audit = audit_cmmloc_public_source(source_root)
+        artifact_audit = audit_cmmloc_coarse_checkpoint(checkpoint_path)
+        if not source_audit.get("source_files_match_pinned_commit"):
+            raise RuntimeError(
+                "Pinned CMMLoc source files are absent or do not match the "
+                f"audited commit {CMMLOC_SOURCE_COMMIT}."
+            )
+        if not artifact_audit.get("compatible_with_official_artifact"):
+            raise RuntimeError(
+                "CMMLoc coarse checkpoint does not match the official "
+                f"release artifact: "
+                f"{artifact_audit.get('official_artifact_mismatches')}"
+            )
+
+        model = CMMLocReleaseCoarseNetwork(
+            KNOWN_CLASS, COLOR_NAMES_K360, release_args
+        )
+        language = model.language_encoder
+        llm_config = language.llm_model.config
+        sentence_preprocessing = validate_sentence_preprocessing()
+        architecture = _architecture_record(
+            release_args,
+            "evaluation.cmmloc_release.CMMLocReleaseCoarseNetwork",
+        )
+        architecture.update(
+            {
+                "release_source_commit": CMMLOC_SOURCE_COMMIT,
+                "release_behavior": (
+                    "Pinned public constructor; checkpoint-only modules are "
+                    "explicitly audited and ignored exactly as in the public "
+                    "evaluation path."
+                ),
+                "text_backbone_config": t5_config_record(llm_config),
+                "text_backbone_expected_config": T5_LARGE_CONFIG,
+                "tokenizer_class": type(language.tokenizer).__name__,
+                "tokenizer_vocab_size": len(language.tokenizer),
+                "sentence_preprocessing": sentence_preprocessing,
+                "tokenizer_truncation": False,
+                "text_backbone_requested": args.hungging_model,
+                "exact_text_backbone_revision_recorded_by_release": False,
+                "text_backbone_scope_warning": (
+                    "The pinned CMMLoc source records PATH_TO_T5 and the "
+                    "checkpoint proves a 1024-dimensional T5-large family, "
+                    "but it does not publish an immutable Hugging Face "
+                    "revision. This Table-8-like backend uses the requested "
+                    "canonical t5-large files and does not claim an exact "
+                    "training-time revision."
+                ),
+                "pointnet_initialization": (
+                    "Every PointNet tensor is loaded from the enclosing "
+                    "audited coarse checkpoint; no standalone checkpoint is "
+                    "used after construction."
+                ),
+                "ignored_checkpoint_prefix_counts_expected": (
+                    CMMLOC_RELEASE_IGNORED_PREFIX_COUNTS
+                ),
+            }
+        )
+        report = audit_and_load_checkpoint(
+            model,
+            checkpoint_path,
+            report_path,
+            backend="cmmloc_release_coarse",
+            allowed_missing_prefixes=FROZEN_TEXT_PREFIXES,
+            allowed_unexpected_prefixes=CMMLOC_RELEASE_IGNORED_PREFIXES,
+            architecture=architecture,
+        )
+        actual_ignored_counts = Counter(
+            key.split(".", 1)[0]
+            for key in report["allowed_unexpected_keys"]
+        )
+        release_mismatches = {}
+        if len(report["allowed_unexpected_keys"]) != (
+            CMMLOC_RELEASE_IGNORED_KEY_COUNT
+        ):
+            release_mismatches["ignored_key_count"] = {
+                "expected": CMMLOC_RELEASE_IGNORED_KEY_COUNT,
+                "actual": len(report["allowed_unexpected_keys"]),
+            }
+        if dict(sorted(actual_ignored_counts.items())) != (
+            CMMLOC_RELEASE_IGNORED_PREFIX_COUNTS
+        ):
+            release_mismatches["ignored_prefix_counts"] = {
+                "expected": CMMLOC_RELEASE_IGNORED_PREFIX_COUNTS,
+                "actual": dict(sorted(actual_ignored_counts.items())),
+            }
+        config_mismatches = t5_config_mismatches(llm_config)
+        if config_mismatches:
+            release_mismatches["text_backbone_config"] = config_mismatches
+        if not sentence_preprocessing.get("compatible"):
+            release_mismatches["sentence_preprocessing"] = (
+                sentence_preprocessing
+            )
+
+        report.update(
+            {
+                "official_artifact_audit": artifact_audit,
+                "pinned_public_source_audit": source_audit,
+                "release_ignored_key_count": len(
+                    report["allowed_unexpected_keys"]
+                ),
+                "release_ignored_prefix_counts": dict(
+                    sorted(actual_ignored_counts.items())
+                ),
+                "release_validation_mismatches": release_mismatches,
+                "exact_training_architecture_claimed": False,
+                "public_release_inference_behavior_claimed": True,
+                "post_load_validation_succeeded": not release_mismatches,
+                "compatible": not release_mismatches,
+            }
+        )
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        if release_mismatches:
+            return BackendPreflight(
+                "cmmloc_release_coarse", False, report_path
+            )
+        return BackendPreflight(
+            "cmmloc_release_coarse", True, report_path, model
+        )
+    except Exception as error:
+        if not report_path.exists():
+            _write_construction_error(
+                report_path, "cmmloc_release_coarse", error
+            )
+        return BackendPreflight(
+            "cmmloc_release_coarse", False, report_path
+        )
 
 
 def _checkpoint_paths(cli: argparse.Namespace) -> dict[str, Path]:
@@ -1037,6 +1210,38 @@ def command_table8_preflight(cli: argparse.Namespace) -> int:
     seed_everything(cli.seed)
     dataset = _load_test_dataset(args)
     signature = dataset_signature(dataset)
+    checkpoint_root = Path(cli.checkpoint_root).resolve()
+    cmmloc_source_root = (
+        Path(cli.cmmloc_source_root).resolve()
+        if cli.cmmloc_source_root
+        else checkpoint_root
+        / "CMMLoc"
+        / "official_source"
+        / f"CMMLoc-{CMMLOC_SOURCE_COMMIT[:12]}"
+    )
+
+    cmmloc_release_check = None
+    cmmloc_release_report = None
+    if not cli.require_exact_table8_count:
+        cmmloc_release_check = _preflight_cmmloc_release_coarse(
+            args=args,
+            checkpoint_path=paths["cmmloc_coarse"],
+            source_root=cmmloc_source_root,
+            report_dir=output_dir / "cmmloc_release_coarse",
+        )
+        device = _resolve_device(cli.device)
+        _smoke_my_coarse(
+            check=cmmloc_release_check,
+            dataset=dataset,
+            args=_cmmloc_release_config(args),
+            device=device,
+        )
+        cmmloc_release_report = json.loads(
+            cmmloc_release_check.report_path.read_text(encoding="utf-8")
+        )
+        if cmmloc_release_check.model is not None:
+            del cmmloc_release_check.model
+            cmmloc_release_check.model = None
 
     vlmloc_dir = output_dir / "vlmloc_fine"
     try:
@@ -1057,21 +1262,14 @@ def command_table8_preflight(cli: argparse.Namespace) -> int:
         vlmloc_check.report_path.read_text(encoding="utf-8")
     )
 
-    checkpoint_root = Path(cli.checkpoint_root).resolve()
-    cmmloc_source_root = (
-        Path(cli.cmmloc_source_root).resolve()
-        if cli.cmmloc_source_root
-        else checkpoint_root
-        / "CMMLoc"
-        / "official_source"
-        / f"CMMLoc-{CMMLOC_SOURCE_COMMIT[:12]}"
-    )
     report = build_table8_preflight_report(
         data_root=Path(cli.data_root),
         dataset_signature=signature,
         cmmloc_coarse_checkpoint=paths["cmmloc_coarse"],
         cmmloc_source_root=cmmloc_source_root,
         vlmloc_report=vlmloc_report,
+        cmmloc_release_runtime_report=cmmloc_release_report,
+        allow_public_release_behavior=not cli.require_exact_table8_count,
         requested_text_backbone=cli.text_backbone,
         require_exact_paper_count=cli.require_exact_table8_count,
         split="test",
@@ -1109,8 +1307,13 @@ def command_table8_preflight(cli: argparse.Namespace) -> int:
         "CMMLoc coarse checkpoint/source architecture: "
         f"{'PASS' if report['checks']['cmmloc_coarse_source_architecture'] else 'FAIL'}"
     )
+    vlmloc_label = (
+        "VLM-Loc exact Table-8 fine backend"
+        if cli.require_exact_table8_count
+        else "VLM-Loc public 30 m fine asset (local retraining required)"
+    )
     print(
-        "VLM-Loc Table-8 fine backend: "
+        f"{vlmloc_label}: "
         f"{'PASS' if report['checks']['vlmloc_table8_fine_backend'] else 'FAIL'}"
     )
     print(f"Preflight report: {report_path}")
@@ -1118,11 +1321,215 @@ def command_table8_preflight(cli: argparse.Namespace) -> int:
         print(
             "Inference was not started because one or more model/backend "
             "compatibility checks failed. Dataset-count warnings alone do not "
-            "block the full-test protocol.",
+            "block the full-test protocol."
+            + (
+                " For the Table-8-like path, continue with "
+                "table8-like-stage1 and local VLM-Loc 30 m retraining; do not "
+                "substitute the CityLoc adapter."
+                if not cli.require_exact_table8_count
+                else ""
+            ),
             file=sys.stderr,
         )
         return 2
     return 0
+
+
+def command_table8_like_stage1(cli: argparse.Namespace) -> int:
+    """Run CMMLoc public-release Top-1 retrieval on all 11,505 queries."""
+
+    output_dir = Path(cli.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    args = _cmmloc_release_config(_model_config(cli))
+    paths = _checkpoint_paths(cli)
+    _validate_paths(paths, ["cmmloc_coarse"])
+    seed_everything(cli.seed)
+    dataset = _load_test_dataset(args)
+    signature = dataset_signature(dataset)
+    if signature["query_count"] != 11_505:
+        raise RuntimeError(
+            "Table-8-like Stage 1 requires all 11,505 ordered test queries; "
+            f"got {signature['query_count']}."
+        )
+
+    checkpoint_root = Path(cli.checkpoint_root).resolve()
+    source_root = (
+        Path(cli.cmmloc_source_root).resolve()
+        if cli.cmmloc_source_root
+        else checkpoint_root
+        / "CMMLoc"
+        / "official_source"
+        / f"CMMLoc-{CMMLOC_SOURCE_COMMIT[:12]}"
+    )
+    check = _preflight_cmmloc_release_coarse(
+        args=args,
+        checkpoint_path=paths["cmmloc_coarse"],
+        source_root=source_root,
+        report_dir=output_dir / "preflight",
+    )
+    device = _resolve_device(cli.device)
+    _smoke_my_coarse(
+        check=check, dataset=dataset, args=args, device=device
+    )
+    if not check.compatible:
+        print(
+            f"CMMLoc release coarse preflight failed: {check.report_path}",
+            file=sys.stderr,
+        )
+        return 2
+
+    model = check.model.to(device)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        collate_fn=Kitti360CoarseDataset.collate_fn,
+        shuffle=False,
+        num_workers=0,
+    )
+    retrievals, metrics = run_coarse(model, dataloader, args)
+    if any(len(row) != 1 for row in retrievals):
+        raise RuntimeError("CMMLoc Stage 1 did not return exactly Top-1")
+    retrieval_recall = _exact_cell_retrieval_recall(
+        retrievals, dataset, args.top_k
+    )
+    print(
+        "CMMLoc release exact-cell Retrieval Recall@1: "
+        f"{retrieval_recall[1]:.6f}"
+    )
+    print_accuracies(
+        metrics,
+        "CMMLoc release cell-center baseline (not VLM-Loc fine)",
+    )
+
+    checkpoint_hash = sha256_file(paths["cmmloc_coarse"])
+    manifest_path = output_dir / "cmmloc_top1_manifest.json"
+    write_table8_like_manifest(
+        manifest_path,
+        dataset=dataset,
+        retrievals=retrievals,
+        coarse_checkpoint=paths["cmmloc_coarse"],
+        coarse_checkpoint_sha256=checkpoint_hash,
+        coarse_audit_path=check.report_path,
+        coarse_configuration={
+            **_architecture_record(
+                args,
+                "evaluation.cmmloc_release.CMMLocReleaseCoarseNetwork",
+            ),
+            "source_commit": CMMLOC_SOURCE_COMMIT,
+            "release_ignored_prefix_counts": (
+                CMMLOC_RELEASE_IGNORED_PREFIX_COUNTS
+            ),
+            "release_ignored_key_count": (
+                CMMLOC_RELEASE_IGNORED_KEY_COUNT
+            ),
+            "batch_size": args.batch_size,
+            "num_workers": 0,
+            "reranking": "none",
+        },
+    )
+    metrics_path = output_dir / "cmmloc_coarse_metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "protocol": "CMMLoc release coarse Top-1 only",
+                "dataset": signature,
+                "checkpoint_sha256": checkpoint_hash,
+                "exact_cell_retrieval_recall_at_1": retrieval_recall[1],
+                "cell_center_localization_recall": _native_metrics(metrics),
+                "fine_localization_run": False,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    print(f"CMMLoc Top-1 manifest: {manifest_path}")
+    print(
+        "Stage 1 completed. These are coarse diagnostics only; VLM-Loc fine "
+        "has not been run."
+    )
+    return 0
+
+
+def command_table8_like_vlmloc_prepare(
+    cli: argparse.Namespace,
+) -> int:
+    """Create 30 m train/val/test VLM data from the CMMLoc Top-1 manifest."""
+
+    audit_path = prepare_vlmloc_data(
+        data_root=Path(cli.data_root),
+        manifest_path=Path(cli.manifest),
+        output_dir=Path(cli.output_dir),
+        overwrite_images=cli.overwrite_images,
+    )
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    print(f"VLM-Loc 30 m data audit: {audit_path}")
+    print(
+        "Prepared samples: "
+        f"train={audit['training']['sample_count']}, "
+        f"validation={audit['validation']['sample_count']}, "
+        f"test={audit['testing']['sample_count']}"
+    )
+    print(
+        "Renderer: processed-cell downsampled points. The VLM-Loc adapter "
+        "must be retrained on this data before fine inference."
+    )
+    return 0
+
+
+def command_table8_like_vlmloc_evaluate(
+    cli: argparse.Namespace,
+) -> int:
+    """Score VLM pixels in world coordinates of each CMMLoc candidate."""
+
+    result_path = evaluate_vlmloc_predictions(
+        predictions_path=Path(cli.predictions),
+        test_index_path=Path(cli.test_index),
+        output_dir=Path(cli.output_dir),
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    print(
+        "VLM-Loc fine localization R@5/10/15m: "
+        f"{result['recall']['5']:.4f}/"
+        f"{result['recall']['10']:.4f}/"
+        f"{result['recall']['15']:.4f}"
+    )
+    print(
+        f"Valid={result['valid_prediction_count']}, "
+        f"invalid-as-miss={result['invalid_prediction_count']}"
+    )
+    print(f"VLM-Loc fine metrics: {result_path}")
+    return 0
+
+
+def command_table8_like_vlmloc_preflight(
+    cli: argparse.Namespace,
+) -> int:
+    checkpoint_root = Path(cli.checkpoint_root).resolve()
+    report_path = audit_vlmloc_runtime_preflight(
+        adapter_dir=Path(cli.adapter_dir),
+        base_model_dir=(
+            checkpoint_root
+            / "VLM-Loc"
+            / "base_models"
+            / "Qwen3-VL-8B-Instruct"
+        ),
+        official_source_dir=(
+            checkpoint_root
+            / "VLM-Loc"
+            / "official_source"
+            / "nku-3d-vision-494a8b4e3fe9"
+        ),
+        data_dir=Path(cli.vlmloc_data_dir),
+        smoke_predictions_path=Path(cli.smoke_predictions),
+        output_dir=Path(cli.output_dir),
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    for name, passed in report["checks"].items():
+        print(f"{name}: {'PASS' if passed else 'FAIL'}")
+    print(f"VLM-Loc runtime preflight: {report_path}")
+    return 0 if report["compatible"] else 2
 
 
 def command_stage1(cli: argparse.Namespace) -> int:
@@ -1421,6 +1828,92 @@ def build_parser() -> argparse.ArgumentParser:
         require_exact_table8_count=False,
     )
     table8_like_preflight.add_argument("--output-dir", required=True)
+
+    table8_like_stage1 = subparsers.add_parser(
+        "table8-like-stage1",
+        help=(
+            "Run audited CMMLoc public-release coarse Top-1 retrieval for "
+            "all 11,505 local test queries."
+        ),
+    )
+    _add_common_arguments(table8_like_stage1)
+    table8_like_stage1.set_defaults(
+        handler=command_table8_like_stage1,
+        top_k=list(TABLE8_TOP_K),
+        thresholds=list(TABLE8_THRESHOLDS_M),
+        coarse_rerank_mode="none",
+    )
+    table8_like_stage1.add_argument("--output-dir", required=True)
+
+    table8_like_vlmloc_prepare = subparsers.add_parser(
+        "table8-like-vlmloc-prepare",
+        help=(
+            "Generate VLM-Loc 30 m train/validation/test data; testing uses "
+            "the exact CMMLoc Top-1 manifest."
+        ),
+    )
+    _add_common_arguments(table8_like_vlmloc_prepare)
+    table8_like_vlmloc_prepare.add_argument(
+        "--manifest", required=True
+    )
+    table8_like_vlmloc_prepare.add_argument(
+        "--output-dir", required=True
+    )
+    table8_like_vlmloc_prepare.add_argument(
+        "--overwrite-images", action="store_true"
+    )
+    table8_like_vlmloc_prepare.set_defaults(
+        handler=command_table8_like_vlmloc_prepare,
+        top_k=list(TABLE8_TOP_K),
+        thresholds=list(TABLE8_THRESHOLDS_M),
+        coarse_rerank_mode="none",
+    )
+
+    table8_like_vlmloc_evaluate = subparsers.add_parser(
+        "table8-like-vlmloc-evaluate",
+        help=(
+            "Convert VLM-Loc predicted pixels through each CMMLoc candidate "
+            "cell bbox and report world-coordinate R@5/10/15m."
+        ),
+    )
+    table8_like_vlmloc_evaluate.add_argument(
+        "--predictions", required=True
+    )
+    table8_like_vlmloc_evaluate.add_argument(
+        "--test-index", required=True
+    )
+    table8_like_vlmloc_evaluate.add_argument(
+        "--output-dir", required=True
+    )
+    table8_like_vlmloc_evaluate.set_defaults(
+        handler=command_table8_like_vlmloc_evaluate
+    )
+
+    table8_like_vlmloc_preflight = subparsers.add_parser(
+        "table8-like-vlmloc-preflight",
+        help=(
+            "Audit prepared 30 m data, LoRA keys/shapes, Qwen base/source, "
+            "and a one-query swift-infer smoke result."
+        ),
+    )
+    table8_like_vlmloc_preflight.add_argument(
+        "--checkpoint-root", required=True
+    )
+    table8_like_vlmloc_preflight.add_argument(
+        "--adapter-dir", required=True
+    )
+    table8_like_vlmloc_preflight.add_argument(
+        "--vlmloc-data-dir", required=True
+    )
+    table8_like_vlmloc_preflight.add_argument(
+        "--smoke-predictions", required=True
+    )
+    table8_like_vlmloc_preflight.add_argument(
+        "--output-dir", required=True
+    )
+    table8_like_vlmloc_preflight.set_defaults(
+        handler=command_table8_like_vlmloc_preflight
+    )
 
     stage1 = subparsers.add_parser("stage1")
     _add_common_arguments(stage1)

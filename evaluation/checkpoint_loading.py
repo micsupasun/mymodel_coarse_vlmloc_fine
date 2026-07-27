@@ -63,13 +63,16 @@ def audit_and_load_checkpoint(
     *,
     backend: str,
     allowed_missing_prefixes: tuple[str, ...] = (),
+    allowed_unexpected_prefixes: tuple[str, ...] = (),
     architecture: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Audit keys and shapes, write a report, then load only if compatible.
 
-    Released checkpoints omit frozen language-model weights. Those omissions
-    may be allowed by an explicit prefix, but every omitted key is still
-    recorded. Unexpected keys and shape mismatches are never allowed.
+    Released checkpoints may omit frozen language-model weights. A pinned
+    public evaluation release may also deliberately ignore a fully enumerated
+    set of checkpoint-only modules. Both cases require explicit prefix
+    allowlists, and every affected key is still recorded and asserted after
+    loading. Shape and dtype mismatches are never allowed.
     """
 
     checkpoint_path = Path(checkpoint_path).resolve()
@@ -110,9 +113,17 @@ def audit_and_load_checkpoint(
         key for key in missing_keys if _matches_prefix(key, allowed_missing_prefixes)
     )
     forbidden_missing_keys = sorted(set(missing_keys) - set(allowed_missing_keys))
+    allowed_unexpected_keys = sorted(
+        key
+        for key in unexpected_keys
+        if _matches_prefix(key, allowed_unexpected_prefixes)
+    )
+    forbidden_unexpected_keys = sorted(
+        set(unexpected_keys) - set(allowed_unexpected_keys)
+    )
     compatible = not (
         forbidden_missing_keys
-        or unexpected_keys
+        or forbidden_unexpected_keys
         or shape_mismatches
         or dtype_mismatches
     )
@@ -126,10 +137,13 @@ def audit_and_load_checkpoint(
         "checkpoint_prefix_counts": _prefix_counts(checkpoint_keys),
         "model_prefix_counts": _prefix_counts(model_keys),
         "allowed_missing_prefixes": list(allowed_missing_prefixes),
+        "allowed_unexpected_prefixes": list(allowed_unexpected_prefixes),
         "missing_keys": missing_keys,
         "allowed_missing_keys": allowed_missing_keys,
         "forbidden_missing_keys": forbidden_missing_keys,
         "unexpected_keys": unexpected_keys,
+        "allowed_unexpected_keys": allowed_unexpected_keys,
+        "forbidden_unexpected_keys": forbidden_unexpected_keys,
         "shape_mismatches": shape_mismatches,
         "dtype_mismatches": dtype_mismatches,
         "architecture": dict(architecture or {}),
@@ -145,17 +159,21 @@ def audit_and_load_checkpoint(
         raise RuntimeError(
             f"{backend} checkpoint audit failed; see {report_path}. "
             f"forbidden missing={len(forbidden_missing_keys)}, "
-            f"unexpected={len(unexpected_keys)}, "
+            f"forbidden unexpected={len(forbidden_unexpected_keys)}, "
             f"shape mismatches={len(shape_mismatches)}, "
             f"dtype mismatches={len(dtype_mismatches)}"
         )
 
-    # strict=False is used only for the fully enumerated frozen-backbone
-    # omissions above. The return value is asserted against that exact list.
+    # strict=False is used only after both mismatch sets have been fully
+    # enumerated and allowlisted above. The return value is asserted against
+    # those exact lists, so it cannot hide a new incompatibility.
     incompatible = model.load_state_dict(checkpoint_state, strict=False)
     loaded_missing = sorted(incompatible.missing_keys)
     loaded_unexpected = sorted(incompatible.unexpected_keys)
-    if loaded_missing != allowed_missing_keys or loaded_unexpected:
+    if (
+        loaded_missing != allowed_missing_keys
+        or loaded_unexpected != allowed_unexpected_keys
+    ):
         raise RuntimeError(
             f"{backend} load result changed after audit: missing={loaded_missing}, "
             f"unexpected={loaded_unexpected}"
