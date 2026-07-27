@@ -22,6 +22,9 @@ from evaluation.vlmloc_kitti360pose import (
     HYBRID_RAW_RENDERER_NAME,
     _assignments,
     _assert_separate_derived_output,
+    _crop_raw_points_to_bbox,
+    _group_selected_indices_by_packed_key,
+    _pack_semantic_instance,
     _processed_fallback_objects,
     _query_message,
     _source_tree_metadata_snapshot,
@@ -169,6 +172,80 @@ def _dataset():
 
 
 class Table8LikePipelineTests(unittest.TestCase):
+    def test_grouped_raw_rows_match_pairwise_reference(self):
+        packed = np.asarray([30, 10, 30, 20, 10, 40], dtype=np.int64)
+        selected = np.asarray([0, 1, 2, 4, 5], dtype=np.int64)
+        grouped = _group_selected_indices_by_packed_key(packed, selected)
+        reference = {
+            int(key): selected[packed[selected] == key]
+            for key in np.unique(packed[selected])
+        }
+        self.assertEqual(set(grouped), set(reference))
+        for key in reference:
+            np.testing.assert_array_equal(grouped[key], reference[key])
+
+    def test_x_sorted_raw_crop_matches_full_boolean_crop(self):
+        xyz = np.asarray(
+            [
+                [35, 15, 2],
+                [5, 5, 1],
+                [25, 25, 3],
+                [15, 15, 2],
+                [20, 50, 2],
+            ],
+            dtype=np.float32,
+        )
+        rgb = np.arange(15, dtype=np.uint8).reshape(5, 3)
+        order = np.argsort(xyz[:, 0], kind="stable")
+        sorted_xyz, sorted_rgb = xyz[order], rgb[order]
+        bbox = np.asarray([10, 10, 0, 30, 30, 5], dtype=np.float64)
+        cropped_xyz, cropped_rgb = _crop_raw_points_to_bbox(
+            sorted_xyz, sorted_rgb, bbox
+        )
+        reference_mask = np.bitwise_and.reduce(
+            (
+                sorted_xyz[:, 0] >= bbox[0],
+                sorted_xyz[:, 1] >= bbox[1],
+                sorted_xyz[:, 2] >= bbox[2],
+                sorted_xyz[:, 0] <= bbox[3],
+                sorted_xyz[:, 1] <= bbox[4],
+                sorted_xyz[:, 2] <= bbox[5],
+            )
+        )
+        np.testing.assert_array_equal(
+            cropped_xyz, sorted_xyz[reference_mask]
+        )
+        np.testing.assert_array_equal(
+            cropped_rgb, sorted_rgb[reference_mask]
+        )
+
+    def test_packed_raw_object_filter_matches_pairwise_reference(self):
+        semantic = np.asarray([17, 17, 37, 41, 39, 7], dtype=np.int64)
+        instance = np.asarray(
+            [17004, 17346, 37015, 41083, 39108, 0],
+            dtype=np.int64,
+        )
+        required_pairs = {(17, 17004), (41, 41083), (7, 0)}
+        required_packed = _pack_semantic_instance(
+            [pair[0] for pair in required_pairs],
+            [pair[1] for pair in required_pairs],
+        )
+        optimized = np.isin(
+            _pack_semantic_instance(semantic, instance),
+            required_packed,
+        )
+        reference = np.asarray(
+            [
+                (int(semantic_id), int(instance_id)) in required_pairs
+                for semantic_id, instance_id in zip(semantic, instance)
+            ]
+        )
+        np.testing.assert_array_equal(optimized, reference)
+
+    def test_packed_raw_object_filter_rejects_collision_range(self):
+        with self.assertRaisesRegex(RuntimeError, "collision-free"):
+            _pack_semantic_instance([17], [10_000_000])
+
     def test_missing_raw_compatibility_uses_only_original_cell_points(self):
         key = ("pole", 17004)
         object_a = SimpleNamespace(

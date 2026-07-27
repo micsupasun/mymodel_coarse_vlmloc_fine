@@ -20,6 +20,7 @@ import json
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -87,6 +88,7 @@ STUFF_CLASSES = frozenset(
         "terrain",
     }
 )
+RAW_INSTANCE_KEY_STRIDE = 10_000_000
 
 
 @dataclass
@@ -399,6 +401,51 @@ def _required_raw_object_keys(
     }
 
 
+def _pack_semantic_instance(
+    semantic: np.ndarray | Sequence[int],
+    instance: np.ndarray | Sequence[int],
+) -> np.ndarray:
+    """Pack exact pairs for one vectorized membership test."""
+
+    semantic_values = np.asarray(semantic, dtype=np.int64)
+    instance_values = np.asarray(instance, dtype=np.int64)
+    if semantic_values.shape != instance_values.shape:
+        raise RuntimeError(
+            "semantic and instance arrays have different shapes: "
+            f"{semantic_values.shape}, {instance_values.shape}"
+        )
+    if np.any(instance_values < 0) or np.any(
+        instance_values >= RAW_INSTANCE_KEY_STRIDE
+    ):
+        raise RuntimeError(
+            "raw instance ID is outside the collision-free packed range "
+            f"[0, {RAW_INSTANCE_KEY_STRIDE})"
+        )
+    return semantic_values * RAW_INSTANCE_KEY_STRIDE + instance_values
+
+
+def _group_selected_indices_by_packed_key(
+    packed_keys: np.ndarray,
+    selected_indices: np.ndarray,
+) -> dict[int, np.ndarray]:
+    """Group selected vertex rows in one sort instead of one scan per key."""
+
+    indices = np.asarray(selected_indices, dtype=np.int64)
+    if not len(indices):
+        return {}
+    selected_keys = np.asarray(packed_keys, dtype=np.int64)[indices]
+    order = np.argsort(selected_keys, kind="stable")
+    sorted_keys = selected_keys[order]
+    unique_keys, starts = np.unique(sorted_keys, return_index=True)
+    ends = np.concatenate(
+        (starts[1:], np.asarray([len(sorted_keys)], dtype=np.int64))
+    )
+    return {
+        int(key): indices[order[start:end]]
+        for key, start, end in zip(unique_keys, starts, ends)
+    }
+
+
 def _rgb_points_u8(rgb: np.ndarray) -> np.ndarray:
     values = np.asarray(rgb, dtype=np.float64)
     if values.ndim != 2 or values.shape[1] != 3:
@@ -543,12 +590,14 @@ def _load_raw_scene_objects(
         raise RuntimeError(
             f"Raw KITTI-360 semantic mapping lacks labels: {unknown_labels}"
         )
-    required_by_semantic: dict[int, set[int]] = {}
     key_by_numeric: dict[tuple[int, int], tuple[str, int]] = {}
     for label, instance_id in required:
         semantic = label_to_semantic[label]
-        required_by_semantic.setdefault(semantic, set()).add(instance_id)
         key_by_numeric[(semantic, instance_id)] = (label, instance_id)
+    required_packed_keys = _pack_semantic_instance(
+        [semantic for semantic, _ in key_by_numeric],
+        [instance for _, instance in key_by_numeric],
+    )
 
     scene_dir = _raw_semantic_scene_directory(
         raw_kitti360_root, scene
@@ -573,7 +622,14 @@ def _load_raw_scene_objects(
         "semantic",
         "instance",
     }
-    for ply_path in ply_paths:
+    print(
+        f"Raw scene scan: scene={scene}, ply_files={len(ply_paths)}, "
+        f"required_object_keys={len(required)}",
+        flush=True,
+    )
+    scene_scan_started = time.perf_counter()
+    for ply_index, ply_path in enumerate(ply_paths, start=1):
+        ply_started = time.perf_counter()
         vertex = PlyData.read(str(ply_path))["vertex"].data
         fields = set(vertex.dtype.names or ())
         missing_fields = sorted(required_fields - fields)
@@ -584,34 +640,22 @@ def _load_raw_scene_objects(
         semantic = np.asarray(vertex["semantic"], dtype=np.int64)
         instance = np.asarray(vertex["instance"], dtype=np.int64)
         total_vertices += len(vertex)
-        selected_mask = np.zeros(len(vertex), dtype=bool)
-        for semantic_id, instance_ids in required_by_semantic.items():
-            selected_mask |= (semantic == semantic_id) & np.isin(
-                instance,
-                np.fromiter(instance_ids, dtype=np.int64),
-            )
+        packed_keys = _pack_semantic_instance(semantic, instance)
+        selected_mask = np.isin(packed_keys, required_packed_keys)
         selected_indices = np.flatnonzero(selected_mask)
         selected_vertices += len(selected_indices)
         if len(selected_indices):
-            selected_semantic = semantic[selected_indices]
-            selected_instance = instance[selected_indices]
-            numeric_pairs = np.unique(
-                np.column_stack(
-                    (selected_semantic, selected_instance)
-                ),
-                axis=0,
+            grouped_rows = _group_selected_indices_by_packed_key(
+                packed_keys, selected_indices
             )
-            for semantic_id, instance_id in numeric_pairs:
+            for packed_key, rows in grouped_rows.items():
+                semantic_id = packed_key // RAW_INSTANCE_KEY_STRIDE
+                instance_id = packed_key % RAW_INSTANCE_KEY_STRIDE
                 key = key_by_numeric.get(
                     (int(semantic_id), int(instance_id))
                 )
                 if key is None:
                     continue
-                pair_mask = (
-                    (selected_semantic == semantic_id)
-                    & (selected_instance == instance_id)
-                )
-                rows = selected_indices[pair_mask]
                 xyz_parts[key].append(
                     np.column_stack(
                         (
@@ -638,6 +682,18 @@ def _load_raw_scene_objects(
                 "vertex_count": len(vertex),
             }
         )
+        print(
+            f"Raw PLY {ply_index}/{len(ply_paths)}: {ply_path.name}, "
+            f"vertices={len(vertex)}, selected={len(selected_indices)}, "
+            f"seconds={time.perf_counter() - ply_started:.2f}",
+            flush=True,
+        )
+    print(
+        f"Raw scene scan complete: scene={scene}, "
+        f"vertices={total_vertices}, selected={selected_vertices}, "
+        f"seconds={time.perf_counter() - scene_scan_started:.2f}",
+        flush=True,
+    )
 
     missing_key_tuples = {
         key for key, parts in xyz_parts.items() if not parts
@@ -665,12 +721,15 @@ def _load_raw_scene_objects(
     raw_objects = {}
     for key in required:
         if xyz_parts[key]:
-            raw_objects[key] = (
-                np.concatenate(xyz_parts[key], axis=0),
-                np.concatenate(rgb_parts[key], axis=0),
-            )
+            xyz = np.concatenate(xyz_parts[key], axis=0)
+            rgb = np.concatenate(rgb_parts[key], axis=0)
         else:
-            raw_objects[key] = fallback_objects[key]
+            xyz, rgb = fallback_objects[key]
+        if key[0] in STUFF_CLASSES and len(xyz):
+            order = np.argsort(xyz[:, 0], kind="stable")
+            xyz = xyz[order]
+            rgb = rgb[order]
+        raw_objects[key] = (xyz, rgb)
     inventory_signature = hashlib.sha256(
         json.dumps(
             inventory,
@@ -690,6 +749,7 @@ def _load_raw_scene_objects(
         ),
         "processed_fallback_object_key_count": len(missing_key_tuples),
         "processed_fallback_objects": fallback_audit,
+        "stuff_point_arrays_sorted_by_world_x": True,
         "allow_processed_missing_raw_fallback": (
             allow_processed_missing_raw_fallback
         ),
@@ -721,6 +781,42 @@ def _world_points_to_linear_pixels(
     np.clip(y_unflipped, 0, image_size - 1, out=y_unflipped)
     y = (image_size - 1) - y_unflipped
     return np.unique(y * image_size + x)
+
+
+def _crop_raw_points_to_bbox(
+    xyz: np.ndarray,
+    rgb: np.ndarray,
+    bbox: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Crop identically, using binary search when points are x-sorted."""
+
+    points = np.asarray(xyz)
+    colors = np.asarray(rgb)
+    if len(points) != len(colors):
+        raise RuntimeError(
+            f"raw xyz/rgb length mismatch: {len(points)}, {len(colors)}"
+        )
+    if not len(points):
+        return points, colors
+    if np.all(points[1:, 0] >= points[:-1, 0]):
+        start = int(np.searchsorted(points[:, 0], bbox[0], side="left"))
+        end = int(np.searchsorted(points[:, 0], bbox[3], side="right"))
+        candidate_xyz = points[start:end]
+        candidate_rgb = colors[start:end]
+    else:
+        candidate_xyz = points
+        candidate_rgb = colors
+    inside = np.bitwise_and.reduce(
+        (
+            candidate_xyz[:, 0] >= bbox[0],
+            candidate_xyz[:, 1] >= bbox[1],
+            candidate_xyz[:, 2] >= bbox[2],
+            candidate_xyz[:, 0] <= bbox[3],
+            candidate_xyz[:, 1] <= bbox[4],
+            candidate_xyz[:, 2] <= bbox[5],
+        )
+    )
+    return candidate_xyz[inside], candidate_rgb[inside]
 
 
 def render_dense_raw_cell(
@@ -761,18 +857,9 @@ def render_dense_raw_cell(
                 "NumPy pinned below 2 for the existing PyTorch/PyG binaries."
             ) from error
 
-        inside = np.bitwise_and.reduce(
-            (
-                raw_xyz[:, 0] >= bbox[0],
-                raw_xyz[:, 1] >= bbox[1],
-                raw_xyz[:, 2] >= bbox[2],
-                raw_xyz[:, 0] <= bbox[3],
-                raw_xyz[:, 1] <= bbox[4],
-                raw_xyz[:, 2] <= bbox[5],
-            )
+        cropped_xyz, cropped_rgb = _crop_raw_points_to_bbox(
+            raw_xyz, raw_rgb, bbox
         )
-        cropped_xyz = raw_xyz[inside]
-        cropped_rgb = raw_rgb[inside]
         if not len(cropped_xyz):
             raise RuntimeError(
                 f"Raw stuff object {key} has no points in cell {cell.id}"
@@ -1056,6 +1143,10 @@ def _prepare_gt_split(
     # Keep only one scene's point arrays in memory at a time. The JSON sample
     # order remains the declared split order.
     for scene in scenes:
+        print(
+            f"Preparing VLM inputs: split={split_name}, scene={scene}",
+            flush=True,
+        )
         dataset = load_ordered_dataset(data_root, [scene])
         cells = {str(cell.id): cell for cell in dataset.all_cells}
         raw_scene_objects = None
@@ -1071,8 +1162,16 @@ def _prepare_gt_split(
                 )
             )
             raw_scene_audits.append(raw_scene_audit)
+            print(
+                f"Raw object audit: scene={scene}, exact_raw_keys="
+                f"{raw_scene_audit['exact_raw_object_key_count']}, "
+                f"processed_fallback_keys="
+                f"{raw_scene_audit['processed_fallback_object_key_count']}",
+                flush=True,
+            )
         rendered: dict[str, tuple[Path, dict[str, Any]]] = {}
-        for cell in dataset.all_cells:
+        render_started = time.perf_counter()
+        for cell_index, cell in enumerate(dataset.all_cells, start=1):
             rendered[str(cell.id)] = _render_cell_once(
                 cell,
                 image_root=image_root,
@@ -1080,6 +1179,17 @@ def _prepare_gt_split(
                 raw_scene_objects=raw_scene_objects,
                 renderer_name=renderer_name,
             )
+            if (
+                cell_index == 1
+                or cell_index % 100 == 0
+                or cell_index == len(dataset.all_cells)
+            ):
+                print(
+                    f"Rendered {split_name} {scene}: "
+                    f"{cell_index}/{len(dataset.all_cells)} cells, "
+                    f"seconds={time.perf_counter() - render_started:.1f}",
+                    flush=True,
+                )
         cell_count += len(dataset.all_cells)
         for pose in dataset.all_poses:
             cell = cells.get(str(pose.cell_id))
@@ -1224,6 +1334,11 @@ def prepare_vlmloc_data(
     rendered = {}
     testing_raw_scene_audits = []
     for scene in SCENE_NAMES_TEST:
+        print(
+            "Preparing VLM inputs: split=testing_cmmloc_top1, "
+            f"scene={scene}",
+            flush=True,
+        )
         scene_short = scene.split("_")[-2]
         scene_cell_ids = [
             cell_id
@@ -1245,7 +1360,15 @@ def prepare_vlmloc_data(
                 )
             )
             testing_raw_scene_audits.append(raw_scene_audit)
-        for cell_id in scene_cell_ids:
+            print(
+                f"Raw object audit: scene={scene}, exact_raw_keys="
+                f"{raw_scene_audit['exact_raw_object_key_count']}, "
+                f"processed_fallback_keys="
+                f"{raw_scene_audit['processed_fallback_object_key_count']}",
+                flush=True,
+            )
+        render_started = time.perf_counter()
+        for cell_index, cell_id in enumerate(scene_cell_ids, start=1):
             rendered[cell_id] = _render_cell_once(
                 cells[cell_id],
                 image_root=image_root,
@@ -1253,6 +1376,17 @@ def prepare_vlmloc_data(
                 raw_scene_objects=raw_scene_objects,
                 renderer_name=selected_renderer_name,
             )
+            if (
+                cell_index == 1
+                or cell_index % 100 == 0
+                or cell_index == len(scene_cell_ids)
+            ):
+                print(
+                    f"Rendered testing {scene}: "
+                    f"{cell_index}/{len(scene_cell_ids)} candidate cells, "
+                    f"seconds={time.perf_counter() - render_started:.1f}",
+                    flush=True,
+                )
     missing_rendered = sorted(set(unique_candidate_ids) - set(rendered))
     if missing_rendered:
         raise RuntimeError(
