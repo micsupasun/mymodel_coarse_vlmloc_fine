@@ -75,6 +75,26 @@ class Table8ReproductionTests(unittest.TestCase):
             {"expected": 11_404, "actual": 11_505},
         )
 
+    def test_local_11505_query_split_passes_full_test_mode(self) -> None:
+        result = audit_table8_dataset(
+            data_root=Path("k360_30-10_scG_pd10_pc4_spY_all"),
+            dataset_signature=_signature(11_505),
+            require_exact_paper_count=False,
+        )
+        self.assertTrue(result["compatible"])
+        self.assertEqual(result["mismatches"], {})
+        self.assertEqual(result["warnings"][0]["delta"], 101)
+        self.assertLess(
+            result["warnings"][0][
+                "worst_case_recall_shift_if_only_101_samples_are_added"
+            ]["percentage_points"],
+            0.88,
+        )
+        self.assertEqual(
+            result["evaluation_scope"],
+            "table8_like_local_full_test_11505",
+        )
+
     def test_exact_table8_dataset_header_passes(self) -> None:
         result = audit_table8_dataset(
             data_root=Path("k360_30-10_scG_pd10_pc4_spY_all"),
@@ -111,6 +131,29 @@ class Table8ReproductionTests(unittest.TestCase):
         self.assertFalse(
             report["safety"]["cross_architecture_checkpoint_load_attempted"]
         )
+
+    def test_full_test_count_warning_is_not_a_combined_report_blocker(
+        self,
+    ) -> None:
+        with workspace_temp_directory() as root:
+            report = build_table8_preflight_report(
+                data_root=root / "k360_30-10_scG_pd10_pc4_spY_all",
+                dataset_signature=_signature(11_505),
+                cmmloc_coarse_checkpoint=root / "coarse.pth",
+                cmmloc_source_root=root / "source",
+                vlmloc_report={
+                    "compatible": False,
+                    "missing_keys": ["Table-8-like fine adapter"],
+                    "unexpected_keys": [],
+                    "shape_mismatches": [],
+                },
+                require_exact_paper_count=False,
+            )
+        self.assertTrue(report["checks"]["dataset"])
+        self.assertEqual(report["warnings"][0]["delta"], 101)
+        blocker_names = {item["check"] for item in report["blockers"]}
+        self.assertNotIn("dataset", blocker_names)
+        self.assertIn("vlmloc_table8_fine_backend", blocker_names)
 
     def test_local_cmmloc_checkpoint_matches_official_artifact_when_present(
         self,

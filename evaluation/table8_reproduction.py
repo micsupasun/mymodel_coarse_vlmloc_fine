@@ -27,6 +27,7 @@ EXPECTED_SEED = 42
 EXPECTED_TOP_K = (1,)
 EXPECTED_THRESHOLDS_M = (5, 10, 15)
 EXPECTED_QUERY_COUNT = 11_404
+EXPECTED_LOCAL_FULL_QUERY_COUNT = 11_505
 EXPECTED_CELL_SIZE_M = 30.0
 EXPECTED_DATASET_TOKEN = "k360_30-10_scG_pd10_pc4_spY_all"
 EXPECTED_TEST_SCENES = (
@@ -119,12 +120,18 @@ def audit_table8_dataset(
     *,
     data_root: Path,
     dataset_signature: Mapping[str, Any],
+    require_exact_paper_count: bool = True,
 ) -> dict[str, Any]:
     actual_scenes = list(dataset_signature.get("ordered_scenes", []))
+    expected_query_count = (
+        EXPECTED_QUERY_COUNT
+        if require_exact_paper_count
+        else EXPECTED_LOCAL_FULL_QUERY_COUNT
+    )
     expected = {
         "dataset_token": EXPECTED_DATASET_TOKEN,
         "split": EXPECTED_SPLIT,
-        "query_count": EXPECTED_QUERY_COUNT,
+        "query_count": expected_query_count,
         "ordered_scenes": list(EXPECTED_TEST_SCENES),
         "cell_size_m": EXPECTED_CELL_SIZE_M,
     }
@@ -146,19 +153,71 @@ def audit_table8_dataset(
         for key in expected
         if actual[key] != expected[key]
     }
+    warnings = []
+    if (
+        not require_exact_paper_count
+        and actual["query_count"] == EXPECTED_LOCAL_FULL_QUERY_COUNT
+    ):
+        warnings.append(
+            {
+                "field": "query_count",
+                "paper_value": EXPECTED_QUERY_COUNT,
+                "local_full_test_value": EXPECTED_LOCAL_FULL_QUERY_COUNT,
+                "delta": (
+                    EXPECTED_LOCAL_FULL_QUERY_COUNT - EXPECTED_QUERY_COUNT
+                ),
+                "relative_delta_from_paper": (
+                    EXPECTED_LOCAL_FULL_QUERY_COUNT - EXPECTED_QUERY_COUNT
+                )
+                / EXPECTED_QUERY_COUNT,
+                "worst_case_recall_shift_if_only_101_samples_are_added": {
+                    "fraction": (
+                        EXPECTED_LOCAL_FULL_QUERY_COUNT - EXPECTED_QUERY_COUNT
+                    )
+                    / EXPECTED_LOCAL_FULL_QUERY_COUNT,
+                    "percentage_points": 100
+                    * (
+                        EXPECTED_LOCAL_FULL_QUERY_COUNT
+                        - EXPECTED_QUERY_COUNT
+                    )
+                    / EXPECTED_LOCAL_FULL_QUERY_COUNT,
+                    "assumption": (
+                        "The paper's 11,404 ordered samples are an unchanged "
+                        "subset and only 101 samples are added."
+                    ),
+                },
+                "effect": (
+                    "Accepted for the requested full local test. Table-8 "
+                    "metrics remain a sanity-check reference, not an exact "
+                    "reproduction target."
+                ),
+            }
+        )
     return {
         "data_root": str(Path(data_root).resolve()),
+        "evaluation_scope": (
+            "exact_table8_11404"
+            if require_exact_paper_count
+            else "table8_like_local_full_test_11505"
+        ),
         "expected": expected,
         "actual": actual,
         "compatible": not mismatches,
         "mismatches": mismatches,
+        "warnings": warnings,
+        "paper_query_count_reference": EXPECTED_QUERY_COUNT,
         "ordered_query_sha256": dataset_signature.get("ordered_query_sha256"),
         "ordered_cell_sha256": dataset_signature.get("ordered_cell_sha256"),
         "scene_query_counts": dataset_signature.get("scene_query_counts"),
         "scene_cell_counts": dataset_signature.get("scene_cell_counts"),
         "reason": (
-            "Table 8 reports 11,404 test samples. A differently ordered or "
-            "differently sized local split is not treated as the same benchmark."
+            "Exact reproduction requires the paper's 11,404 samples."
+            if require_exact_paper_count
+            else (
+                "The requested evaluation uses every ordered local test query. "
+                "The 101-sample difference from Table 8 is recorded as a "
+                "comparison warning and does not fail this dataset audit."
+            )
         ),
     }
 
@@ -421,6 +480,7 @@ def build_table8_preflight_report(
     cmmloc_source_root: Path,
     vlmloc_report: Mapping[str, Any],
     requested_text_backbone: str = "t5-large",
+    require_exact_paper_count: bool = True,
     split: str = EXPECTED_SPLIT,
     seed: int = EXPECTED_SEED,
     top_k: Sequence[int] = EXPECTED_TOP_K,
@@ -435,6 +495,7 @@ def build_table8_preflight_report(
     dataset = audit_table8_dataset(
         data_root=data_root,
         dataset_signature=dataset_signature,
+        require_exact_paper_count=require_exact_paper_count,
     )
     checkpoint = audit_cmmloc_coarse_checkpoint(cmmloc_coarse_checkpoint)
     source = audit_cmmloc_public_source(cmmloc_source_root)
@@ -459,6 +520,7 @@ def build_table8_preflight_report(
         "vlmloc_table8_fine_backend": vlmloc_compatible,
     }
     blockers = []
+    warnings = list(dataset.get("warnings", []))
     if not checks["protocol"]:
         blockers.append(
             {"check": "protocol", "details": protocol["mismatches"]}
@@ -516,8 +578,17 @@ def build_table8_preflight_report(
     return {
         "schema_version": 1,
         "experiment": (
-            "CMMLoc baseline coarse Top-1 + VLM-Loc fine on "
-            "KITTI360Pose test"
+            "CMMLoc baseline coarse Top-1 + VLM-Loc fine on KITTI360Pose "
+            + (
+                "paper test subset"
+                if require_exact_paper_count
+                else "full local test set"
+            )
+        ),
+        "comparison_label": (
+            "exact VLM-Loc Table-8 reproduction"
+            if require_exact_paper_count
+            else "Table-8-like full-test evaluation"
         ),
         "protocol": protocol,
         "dataset_audit": dataset,
@@ -529,6 +600,7 @@ def build_table8_preflight_report(
         "all_compatible": all(checks.values()),
         "inference_authorized": all(checks.values()),
         "blockers": blockers,
+        "warnings": warnings,
         "safety": {
             "my_model_used": False,
             "retrieval_top_k": 1,

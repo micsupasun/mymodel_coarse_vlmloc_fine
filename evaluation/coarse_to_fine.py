@@ -1028,7 +1028,7 @@ def command_preflight(cli: argparse.Namespace) -> int:
 
 
 def command_table8_preflight(cli: argparse.Namespace) -> int:
-    """Audit only CMMLoc Top-1 -> VLM-Loc fine Table-8 reproduction."""
+    """Audit CMMLoc Top-1 -> VLM-Loc fine without using my_model."""
 
     output_dir = Path(cli.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1073,16 +1073,33 @@ def command_table8_preflight(cli: argparse.Namespace) -> int:
         cmmloc_source_root=cmmloc_source_root,
         vlmloc_report=vlmloc_report,
         requested_text_backbone=cli.text_backbone,
+        require_exact_paper_count=cli.require_exact_table8_count,
         split="test",
         seed=cli.seed,
         top_k=cli.top_k,
         thresholds_m=cli.thresholds,
     )
-    report_path = write_table8_preflight_report(
-        output_dir / "table8_step1_preflight.json", report
+    report_name = (
+        "table8_step1_preflight.json"
+        if cli.require_exact_table8_count
+        else "table8_like_full_test_preflight.json"
     )
-    print("Table-8 step 1 protocol: CMMLoc coarse Top-1 -> VLM-Loc fine")
-    print(f"Dataset queries: {signature['query_count']} (Table 8: 11404)")
+    report_path = write_table8_preflight_report(
+        output_dir / report_name, report
+    )
+    print(
+        "Protocol: CMMLoc coarse Top-1 -> VLM-Loc fine "
+        f"({report['comparison_label']})"
+    )
+    count_status = (
+        "required exact match"
+        if cli.require_exact_table8_count
+        else "accepted full-test difference"
+    )
+    print(
+        f"Dataset queries: {signature['query_count']} "
+        f"(Table 8: 11404; {count_status})"
+    )
     checkpoint_audit = report["cmmloc_coarse_checkpoint_audit"]
     print(
         "CMMLoc coarse official artifact: "
@@ -1096,11 +1113,12 @@ def command_table8_preflight(cli: argparse.Namespace) -> int:
         "VLM-Loc Table-8 fine backend: "
         f"{'PASS' if report['checks']['vlmloc_table8_fine_backend'] else 'FAIL'}"
     )
-    print(f"Table-8 step 1 preflight: {report_path}")
+    print(f"Preflight report: {report_path}")
     if not report["all_compatible"]:
         print(
-            "Inference was not started because the exact Table-8 protocol is "
-            "not fully reproducible from the audited artifacts.",
+            "Inference was not started because one or more model/backend "
+            "compatibility checks failed. Dataset-count warnings alone do not "
+            "block the full-test protocol.",
             file=sys.stderr,
         )
         return 2
@@ -1383,8 +1401,26 @@ def build_parser() -> argparse.ArgumentParser:
         top_k=list(TABLE8_TOP_K),
         thresholds=list(TABLE8_THRESHOLDS_M),
         coarse_rerank_mode="none",
+        require_exact_table8_count=True,
     )
     table8_preflight.add_argument("--output-dir", required=True)
+
+    table8_like_preflight = subparsers.add_parser(
+        "table8-like-preflight",
+        help=(
+            "Audit CMMLoc coarse Top-1 + VLM-Loc fine on all 11,505 local "
+            "KITTI360Pose test queries; Table 8 is a reference only."
+        ),
+    )
+    _add_common_arguments(table8_like_preflight)
+    table8_like_preflight.set_defaults(
+        handler=command_table8_preflight,
+        top_k=list(TABLE8_TOP_K),
+        thresholds=list(TABLE8_THRESHOLDS_M),
+        coarse_rerank_mode="none",
+        require_exact_table8_count=False,
+    )
+    table8_like_preflight.add_argument("--output-dir", required=True)
 
     stage1 = subparsers.add_parser("stage1")
     _add_common_arguments(stage1)

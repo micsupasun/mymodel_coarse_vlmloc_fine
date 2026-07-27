@@ -4,24 +4,28 @@
 
 The experiments must be run in this order:
 
-1. **Current scope:** CMMLoc baseline coarse Top-1 + VLM-Loc fine, reproducing
-   VLM-Loc Table 8.
+1. **Current scope:** CMMLoc baseline coarse Top-1 + VLM-Loc fine on every
+   local KITTI360Pose test query, using VLM-Loc Table 8 as a sanity-check
+   reference rather than requiring an identical sample subset.
 2. `my_model` coarse + `my_model` fine.
 3. `my_model` coarse + VLM-Loc fine.
 4. `my_model` coarse + CMMLoc/MNCL fine.
 
 Step 1 is a different protocol from the shared-`my_model` pipeline documented
-later in this file. It must use:
+later in this file. The requested full-test variant uses:
 
 - split: KITTI360Pose **test**;
 - retrieval: CMMLoc baseline, **Top-1 only**;
 - localization: VLM-Loc fine;
 - metric: localization `R@5/10/15 m`;
-- reported Table-8 sample count: **11,404**;
+- local full-test sample count: **11,505**;
+- reported Table-8 sample count: **11,404** (reference only);
 - reported VLM-Loc reference: **40.36/51.69/54.74**.
 
 It must not construct or load `my_model`, and it must not report Top-3/5/10
-retrieval results as Table-8 localization results.
+retrieval results as Table-8 localization results. The 101 additional local
+queries are accepted and reported as a warning; they are not arbitrarily
+removed.
 
 ### Step-1 setup and preflight
 
@@ -31,16 +35,17 @@ On the GPU machine, download/audit only the obtainable official assets:
 python scripts\setup_table8_step1_gpu.py --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --output-dir "evaluation_outputs\table8_step1_setup"
 ```
 
-Then run the dedicated fail-closed preflight:
+Then run the dedicated full-test fail-closed preflight:
 
 ```cmd
-python -m evaluation.coarse_to_fine table8-preflight --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --device "cuda:0" --output-dir "evaluation_outputs\table8_step1_preflight"
+python -m evaluation.coarse_to_fine table8-like-preflight --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --text-backbone "t5-large" --device "cuda:0" --output-dir "evaluation_outputs\table8_like_full_test_preflight"
 ```
 
 Both commands currently return exit code 2 after writing their JSON audit.
 That result is expected from the public artifacts currently available; it is
-not an instruction to bypass the checks. Inference is not exposed until every
-required check passes.
+not caused by the 11,505-query count and is not an instruction to bypass the
+remaining model checks. Inference is not exposed until every required model
+check passes.
 
 Confirmed blockers:
 
@@ -52,8 +57,9 @@ Confirmed blockers:
    keys. The official evaluation script hides these as unexpected keys with
    `strict=False`; this pipeline reports them and refuses to guess the training
    architecture.
-2. The local ordered test split has 11,505 queries, while Table 8 explicitly
-   reports 11,404. The ordered query/cell fingerprints are written to the
+2. The local ordered test split has 11,505 queries, while Table 8 reports
+   11,404. In the requested full-test mode this is an accepted warning, not a
+   blocker. The ordered query/cell fingerprints are still written to the
    audit.
 3. The downloadable VLM-Loc adapter/test assets are CityLoc-K/50 m artifacts.
    Table 8 states that VLM-Loc was separately retrained on KITTI360Pose, but
