@@ -27,6 +27,29 @@ retrieval results as Table-8 localization results. The 101 additional local
 queries are accepted and reported as a warning; they are not arbitrarily
 removed.
 
+### Direct-checkpoint audit result
+
+No public checkpoint directly matching the paper's KITTI360Pose 30 m/Table-8
+run was found. The ModelScope release contains one `checkpoints.tar.gz`; its
+Qwen3-VL-8B `checkpoint-3600` is a real LoRA adapter, but its own `args.json`
+records `vlmloc_data_v5`, `k360_50-10_gridCells...`, five training epochs and
+the public CityLoc data paths. It must not be relabelled as the separately
+retrained KITTI360Pose adapter. The paper explicitly says VLM-Loc was
+retrained on KITTI360Pose for Table 8.
+
+If the model, CMMLoc candidates and original 11,404 predictions were identical
+and the only change were appending 101 queries, the rounded Table-8 references
+would move only within these approximate ranges:
+
+- R@5: 40.01% to 40.88%;
+- R@10: 51.24% to 52.11%;
+- R@15: 54.26% to 55.14%.
+
+That narrow bound does not apply when the checkpoint, renderer, preprocessing,
+or Top-1 candidates differ. The final metric report writes both this
+sample-count-only envelope and the geometric upper bound imposed by each
+CMMLoc candidate.
+
 ### Step-1 setup and preflight
 
 On the GPU machine, download/audit only the obtainable official assets:
@@ -73,22 +96,55 @@ python -m evaluation.coarse_to_fine table8-like-stage1 --data-root "data\k360_30
 `cmmloc_coarse_metrics.json` is a coarse diagnostic, not the VLM-Loc fine
 result. The candidate hand-off is `cmmloc_top1_manifest.json`.
 
-### Step 1B: create separate KITTI360Pose 30 m VLM data
+### Step 1B: obtain raw KITTI-360 points without changing KITTI360Pose
 
-The public VLM renderer used dense raw points, but the local processed folder
-contains only normalized downsampled cell points. The following command uses
-those points consistently for train, validation, and test and records that
-deviation. The VLM adapter must be retrained on these exact images.
+The public VLM renderer uses dense KITTI-360 semantic/RGB points. The
+processed KITTI360Pose pickles intentionally contain only downsampled points,
+so using only those pickles is a fallback and is not the closest public
+reproduction. Download the official accumulated semantic point clouds and
+poses into a separate directory:
 
 ```cmd
-python -m evaluation.coarse_to_fine table8-like-vlmloc-prepare --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --manifest "evaluation_outputs\table8_like_stage1_cmmloc\cmmloc_top1_manifest.json" --output-dir "evaluation_outputs\table8_like_vlmloc_data"
+python scripts\setup_kitti360_raw_vlmloc_gpu.py --raw-root "data\KITTI-360-raw" --output-dir "evaluation_outputs\kitti360_raw_setup"
+```
+
+This is a large resumable download (roughly 13.2 GB compressed); keep at least
+35 GB free. It does not write to
+`data\k360_30-10_scG_pd10_pc4_spY_all`. It validates every train/validation/
+test scene required by the original KITTI360Pose split.
+
+Install the two preparation-only dependencies in the current `cmmloc_mncl`
+environment; the preparation CLI also imports the existing KITTI360Pose/
+CMMLoc code:
+
+```cmd
+python -m pip install plyfile scikit-learn
+```
+
+### Step 1C: derive VLM inputs without creating a new KITTI360Pose dataset
+
+The next command preserves every original 30 m cell, pose, split, cell ID and
+query order. It adds zero KITTI360Pose samples and writes nothing under the
+original `--data-root`. It only creates the BEV images and JSON prompts that
+the Qwen-based VLM-Loc interface requires, under the separate `--output-dir`.
+The command refuses an output directory that overlaps either source tree and
+records before/after source-tree snapshots in
+`vlmloc_data_preparation_audit.json`.
+
+The renderer enriches the BEV representation with official dense points, uses
+the public stuff-before-object draw priority and footprint centroids, and uses
+the public PNA rule (nearest same-label node; 15 m for stuff, 5 m for objects,
+50 m for road). It fails rather than silently using downsampled points:
+
+```cmd
+python -m evaluation.coarse_to_fine table8-like-vlmloc-prepare --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --manifest "evaluation_outputs\table8_like_stage1_cmmloc\cmmloc_top1_manifest.json" --raw-kitti360-root "data\KITTI-360-raw" --require-dense-raw --output-dir "evaluation_outputs\table8_like_vlmloc_data_dense_raw"
 ```
 
 The testing JSON contains exactly 11,505 samples in manifest order. The
 sidecar `vlmloc_testing_index.json` retains each candidate bbox and true world
 pose so the final metric is computed in metres, not merely as pixel error.
 
-### Step 1C: download Qwen and retrain VLM-Loc
+### Step 1D: download Qwen and retrain VLM-Loc
 
 Use a separate VLM environment so `ms-swift` does not alter the working
 CMMLoc/PyG environment:
@@ -102,7 +158,7 @@ conda activate vlmloc_qwen
 ```
 
 ```cmd
-python -m pip install -U "ms-swift[llm]" pillow huggingface_hub
+python -m pip install -U "ms-swift[llm]" pillow huggingface_hub plyfile scikit-learn
 ```
 
 Download the complete Qwen3-VL-8B base at a resolved immutable revision and
@@ -112,46 +168,88 @@ audit the pinned VLM-Loc source. The CityLoc adapter is skipped:
 python scripts\setup_vlmloc_gpu.py --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --output-dir "evaluation_outputs\table8_like_vlmloc_setup" --table8-like-retraining
 ```
 
-Train with the public VLM-Loc LoRA settings:
+Before training, record the available GPU count and VRAM:
 
 ```cmd
-set CUDA_VISIBLE_DEVICES=0&& set NCCL_P2P_DISABLE=1&& set NCCL_IB_DISABLE=1&& swift sft --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\base_models\Qwen3-VL-8B-Instruct" --dataset "evaluation_outputs\table8_like_vlmloc_data\vlmloc_training_data.json" --val_dataset "evaluation_outputs\table8_like_vlmloc_data\vlmloc_validation_data.json" --tuner_type lora --torch_dtype bfloat16 --num_train_epochs 5 --per_device_train_batch_size 1 --per_device_eval_batch_size 1 --learning_rate 1e-4 --lora_rank 8 --lora_alpha 16 --target_modules all-linear --freeze_vit false --freeze_aligner false --gradient_accumulation_steps 2 --eval_steps 300 --save_steps 300 --warmup_ratio 0.05 --dataloader_num_workers 4 --dataset_num_proc 1 --save_total_limit 5 --gradient_checkpointing true --seed 42 --data_seed 42 --add_version false --output_dir "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs"
+nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
+```
+
+The paper reports Qwen3-VL-8B, LoRA rank 8/alpha 16, BF16, learning rate
+1e-4, two epochs and global batch size 4. The downloadable CityLoc adapter
+metadata instead records five epochs; that is another reason it is not a
+direct Table-8 checkpoint. The primary Table-8-like command follows the paper.
+On one GPU, batch size 1 with four accumulation steps preserves global batch
+size 4. This requires a high-memory GPU; do not silently switch to QLoRA,
+quantization or a smaller backbone after an out-of-memory error.
+
+```cmd
+set CUDA_VISIBLE_DEVICES=0&& set NCCL_P2P_DISABLE=1&& set NCCL_IB_DISABLE=1&& swift sft --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\base_models\Qwen3-VL-8B-Instruct" --attn_impl flash_attn --dataset "evaluation_outputs\table8_like_vlmloc_data_dense_raw\vlmloc_training_data.json" --val_dataset "evaluation_outputs\table8_like_vlmloc_data_dense_raw\vlmloc_validation_data.json" --train_type lora --torch_dtype bfloat16 --num_train_epochs 2 --per_device_train_batch_size 1 --per_device_eval_batch_size 1 --learning_rate 1e-4 --lora_rank 8 --lora_alpha 16 --target_modules all-linear --freeze_vit false --freeze_aligner false --gradient_accumulation_steps 4 --eval_steps 300 --save_steps 300 --warmup_ratio 0.05 --dataloader_num_workers 4 --dataset_num_proc 1 --save_total_limit 5 --gradient_checkpointing true --seed 42 --data_seed 42 --add_version false --output_dir "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs_dense_raw"
 ```
 
 Select the saved `checkpoint-N` with the lowest validation loss. Do not assume
 that a CityLoc checkpoint number, such as 3600, is correct for this dataset.
+The selected directory is retained as the resumable training checkpoint: it
+contains the LoRA, optimizer/scheduler state, RNG state, and trainer state.
+The next step additionally produces the requested standalone full checkpoint.
 
-### Step 1D: one-query VLM runtime preflight
+### Step 1E: one-query VLM runtime preflight
 
 Replace `<checkpoint-N>` with that selected checkpoint. Use a fresh result
 path because `swift infer` appends to an existing JSONL:
 
 ```cmd
-set CUDA_VISIBLE_DEVICES=0&& swift infer --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\base_models\Qwen3-VL-8B-Instruct" --adapters "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs\checkpoint-N" --infer_backend transformers --val_dataset "evaluation_outputs\table8_like_vlmloc_data\vlmloc_testing_smoke_1.json" --val_dataset_sample 1 --dataset_shuffle false --max_new_tokens 512 --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --result_path "evaluation_outputs\table8_like_stage2_vlmloc_preflight\smoke_predictions.jsonl"
+set CUDA_VISIBLE_DEVICES=0&& swift infer --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\base_models\Qwen3-VL-8B-Instruct" --adapters "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs_dense_raw\checkpoint-N" --infer_backend transformers --val_dataset "evaluation_outputs\table8_like_vlmloc_data_dense_raw\vlmloc_testing_smoke_1.json" --val_dataset_sample 1 --dataset_shuffle false --temperature 0 --max_new_tokens 512 --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --result_path "evaluation_outputs\table8_like_stage2_vlmloc_preflight\adapter_smoke_predictions.jsonl"
 ```
 
 Audit the data hashes, LoRA keys/internal shapes, base shards/revision, source
 and environment, and actual one-query load/generation:
 
 ```cmd
-python -m evaluation.coarse_to_fine table8-like-vlmloc-preflight --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --adapter-dir "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs\checkpoint-N" --vlmloc-data-dir "evaluation_outputs\table8_like_vlmloc_data" --smoke-predictions "evaluation_outputs\table8_like_stage2_vlmloc_preflight\smoke_predictions.jsonl" --output-dir "evaluation_outputs\table8_like_stage2_vlmloc_preflight"
+python -m evaluation.coarse_to_fine table8-like-vlmloc-preflight --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --adapter-dir "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs_dense_raw\checkpoint-N" --vlmloc-data-dir "evaluation_outputs\table8_like_vlmloc_data_dense_raw" --smoke-predictions "evaluation_outputs\table8_like_stage2_vlmloc_preflight\adapter_smoke_predictions.jsonl" --require-dense-raw --output-dir "evaluation_outputs\table8_like_stage2_vlmloc_preflight"
 ```
 
 Do not start full inference unless all five checks print PASS.
 
-### Step 1E: full VLM fine inference and metric
+### Step 1F: create and audit the standalone full checkpoint
+
+Keep at least another 20 GB free for the merged BF16 model. Merging does not
+delete or overwrite either the frozen Qwen base or the resumable LoRA
+checkpoint:
+
+```cmd
+set CUDA_VISIBLE_DEVICES=0&& swift export --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\base_models\Qwen3-VL-8B-Instruct" --adapters "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs_dense_raw\checkpoint-N" --merge_lora true --safe_serialization true --output_dir "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_full_dense_raw"
+```
+
+Run the same deterministic one-query smoke with the standalone model:
+
+```cmd
+set CUDA_VISIBLE_DEVICES=0&& swift infer --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_full_dense_raw" --infer_backend transformers --val_dataset "evaluation_outputs\table8_like_vlmloc_data_dense_raw\vlmloc_testing_smoke_1.json" --val_dataset_sample 1 --dataset_shuffle false --temperature 0 --max_new_tokens 512 --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --result_path "evaluation_outputs\table8_like_stage2_vlmloc_merged_preflight\merged_smoke_predictions.jsonl"
+```
+
+Audit that the output contains full Qwen tensors, has no LoRA namespace,
+matches the base tensor namespace, changes sampled LoRA target tensors, and
+produces the same smoke prediction as base-plus-adapter:
+
+```cmd
+python -m evaluation.coarse_to_fine table8-like-vlmloc-merged-preflight --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --adapter-dir "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs_dense_raw\checkpoint-N" --merged-model-dir "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_full_dense_raw" --adapter-smoke-predictions "evaluation_outputs\table8_like_stage2_vlmloc_preflight\adapter_smoke_predictions.jsonl" --merged-smoke-predictions "evaluation_outputs\table8_like_stage2_vlmloc_merged_preflight\merged_smoke_predictions.jsonl" --output-dir "evaluation_outputs\table8_like_stage2_vlmloc_merged_preflight"
+```
+
+Do not use the full checkpoint unless every merged-checkpoint check prints
+PASS.
+
+### Step 1G: full VLM fine inference and metric
 
 The fine output directory is separate from CMMLoc Stage 1:
 
 ```cmd
-set CUDA_VISIBLE_DEVICES=0&& swift infer --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\base_models\Qwen3-VL-8B-Instruct" --adapters "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_runs\checkpoint-N" --infer_backend transformers --val_dataset "evaluation_outputs\table8_like_vlmloc_data\vlmloc_testing_data.json" --dataset_shuffle false --max_batch_size 1 --max_new_tokens 512 --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --result_path "evaluation_outputs\table8_like_stage2_vlmloc\predictions.jsonl"
+set CUDA_VISIBLE_DEVICES=0&& swift infer --model "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\table8_kitti360pose_30m\qwen3_vl_8b_full_dense_raw" --infer_backend transformers --val_dataset "evaluation_outputs\table8_like_vlmloc_data_dense_raw\vlmloc_testing_data.json" --dataset_shuffle false --max_batch_size 1 --temperature 0 --max_new_tokens 512 --system "checkpoints\k360_30-10_scG_pd10_pc4_spY_all\VLM-Loc\official_source\nku-3d-vision-494a8b4e3fe9\vlm-loc\system_prompt.txt" --result_path "evaluation_outputs\table8_like_stage2_vlmloc_full_dense_raw\predictions.jsonl"
 ```
 
 Score every prediction in the world frame of its exact CMMLoc candidate;
 malformed outputs count as misses:
 
 ```cmd
-python -m evaluation.coarse_to_fine table8-like-vlmloc-evaluate --predictions "evaluation_outputs\table8_like_stage2_vlmloc\predictions.jsonl" --test-index "evaluation_outputs\table8_like_vlmloc_data\vlmloc_testing_index.json" --output-dir "evaluation_outputs\table8_like_stage2_vlmloc"
+python -m evaluation.coarse_to_fine table8-like-vlmloc-evaluate --predictions "evaluation_outputs\table8_like_stage2_vlmloc_full_dense_raw\predictions.jsonl" --test-index "evaluation_outputs\table8_like_vlmloc_data_dense_raw\vlmloc_testing_index.json" --output-dir "evaluation_outputs\table8_like_stage2_vlmloc_full_dense_raw"
 ```
 
 The fine stage never retrieves again or replaces the Stage-1 candidate.

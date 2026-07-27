@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import struct
 import unittest
 import uuid
 from pathlib import Path
@@ -18,12 +19,20 @@ from evaluation.table8_like_protocol import (
     write_table8_like_manifest,
 )
 from evaluation.vlmloc_kitti360pose import (
+    _assignments,
+    _assert_separate_derived_output,
+    _query_message,
+    _source_tree_metadata_snapshot,
+    audit_vlmloc_merged_checkpoint,
     evaluate_vlmloc_predictions,
+    load_ordered_dataset,
     normalized_xy_to_pixel,
     pixel_to_world_xy,
+    render_dense_raw_cell,
     render_processed_cell,
     world_xy_to_pixel,
 )
+from evaluation.vlmloc_release import inspect_full_model
 
 
 def _temporary_directory():
@@ -39,8 +48,85 @@ def _description():
         direction="north",
         object_color_text="green",
         object_label="vegetation",
+        object_center=np.asarray([0.5, 0.5, 0.0]),
         object_id="1",
         is_matched=True,
+    )
+
+
+def _write_safetensors(path, tensors):
+    offset = 0
+    header = {}
+    payload = bytearray()
+    for key, (shape, dtype, raw) in tensors.items():
+        raw = bytes(raw)
+        header[key] = {
+            "dtype": dtype,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + len(raw)],
+        }
+        payload.extend(raw)
+        offset += len(raw)
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * ((8 - len(encoded) % 8) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+
+
+def _write_fake_full_model(directory, payload, *, revision=False):
+    directory.mkdir(parents=True)
+    (directory / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_vl",
+                "architectures": ["Qwen3VLForConditionalGeneration"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    for name in (
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+    ):
+        (directory / name).write_text("{}", encoding="utf-8")
+    key = "model.language_model.layers.0.self_attn.q_proj.weight"
+    shard_name = "model-00001-of-00001.safetensors"
+    _write_safetensors(
+        directory / shard_name,
+        {key: ([2, 2], "F32", payload)},
+    )
+    (directory / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: shard_name}}),
+        encoding="utf-8",
+    )
+    if revision:
+        (directory / ".huggingface_model_revision").write_text(
+            "a" * 40 + "\n", encoding="utf-8"
+        )
+
+
+def _write_fake_adapter(directory):
+    directory.mkdir(parents=True)
+    (directory / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "task_type": "CAUSAL_LM",
+                "r": 1,
+                "lora_alpha": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prefix = (
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj"
+    )
+    _write_safetensors(
+        directory / "adapter_model.safetensors",
+        {
+            f"{prefix}.lora_A.weight": ([1, 2], "F32", b"\x01" * 8),
+            f"{prefix}.lora_B.weight": ([2, 1], "F32", b"\x02" * 8),
+        },
     )
 
 
@@ -81,6 +167,48 @@ def _dataset():
 
 
 class Table8LikePipelineTests(unittest.TestCase):
+    def test_derived_output_cannot_overlap_source_dataset(self):
+        root, directory = _temporary_directory()
+        try:
+            data_root = directory / "source_data"
+            data_root.mkdir()
+            with self.assertRaisesRegex(
+                RuntimeError, "derived output must be separate"
+            ):
+                _assert_separate_derived_output(
+                    data_root=data_root,
+                    output_dir=data_root / "generated_vlm_inputs",
+                    raw_kitti360_root=None,
+                )
+        finally:
+            shutil.rmtree(directory)
+            try:
+                root.rmdir()
+            except OSError:
+                pass
+
+    def test_source_snapshot_detects_changes_but_not_derived_outputs(self):
+        root, directory = _temporary_directory()
+        try:
+            data_root = directory / "source_data"
+            output_root = directory / "derived_inputs"
+            data_root.mkdir()
+            output_root.mkdir()
+            (data_root / "pose.pkl").write_bytes(b"original")
+            before = _source_tree_metadata_snapshot(data_root)
+            (output_root / "bev.png").write_bytes(b"derived")
+            after_output_write = _source_tree_metadata_snapshot(data_root)
+            self.assertEqual(before, after_output_write)
+            (data_root / "new_query.pkl").write_bytes(b"not-allowed")
+            after_source_write = _source_tree_metadata_snapshot(data_root)
+            self.assertNotEqual(before, after_source_write)
+        finally:
+            shutil.rmtree(directory)
+            try:
+                root.rmdir()
+            except OSError:
+                pass
+
     def test_cmmloc_release_allowlist_has_exact_public_counts(self):
         self.assertEqual(
             sum(CMMLOC_CHECKPOINT_ONLY_PREFIX_COUNTS.values()), 155
@@ -192,12 +320,129 @@ class Table8LikePipelineTests(unittest.TestCase):
             rgb=np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
         )
         image, audit = render_processed_cell(
-            SimpleNamespace(objects=[instance, stuff])
+            SimpleNamespace(
+                objects=[instance, stuff],
+                bbox_w=np.asarray([0, 0, 0, 30, 30, 5]),
+            )
         )
         x, y = normalized_xy_to_pixel([0.5, 0.5])
         self.assertEqual(image[y, x].tolist(), [0, 0, 255])
+        self.assertEqual(
+            [node["label"] for node in audit["nodes"]],
+            ["road", "pole"],
+        )
+        self.assertEqual(
+            audit["nodes"][0]["pixel_center"],
+            [x, y],
+        )
         self.assertEqual(audit["objects_with_raw_attributes"], 0)
         self.assertEqual(audit["downsampled_point_count"], 2)
+
+    def test_dense_renderer_uses_raw_footprint_and_public_centroid(self):
+        obj = SimpleNamespace(
+            id=2,
+            instance_id=17002,
+            label="pole",
+            xyz=np.asarray([[0.5, 0.5, 0.0]], dtype=np.float32),
+            rgb=np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        )
+        cell = SimpleNamespace(
+            id="0003_00000",
+            objects=[obj],
+            bbox_w=np.asarray([0, 0, 0, 30, 30, 5]),
+            cell_size=30.0,
+        )
+        image, audit = render_dense_raw_cell(
+            cell,
+            {
+                ("pole", 17002): (
+                    np.asarray(
+                        [[1, 1, 0], [29, 29, 0]], dtype=np.float32
+                    ),
+                    np.asarray(
+                        [[255, 0, 0], [255, 0, 0]], dtype=np.uint8
+                    ),
+                )
+            },
+        )
+        self.assertEqual(audit["dense_raw_point_count"], 2)
+        self.assertEqual(audit["rendered_object_count"], 1)
+        self.assertEqual(audit["nodes"][0]["pixel_center"], [112, 112])
+        first = world_xy_to_pixel([1, 1], cell.bbox_w)[0]
+        self.assertEqual(
+            image[first[1], first[0]].tolist(), [255, 0, 0]
+        )
+
+    def test_partial_node_assignment_uses_public_distance_thresholds(self):
+        pose = SimpleNamespace(
+            pose_w=np.asarray([100.0, 100.0, 0.0]),
+            descriptions=[
+                SimpleNamespace(
+                    object_label="vegetation",
+                    object_center=np.asarray([0.5, 0.5, 0.0]),
+                    object_id="does-not-control-grounding",
+                ),
+                SimpleNamespace(
+                    object_label="pole",
+                    object_center=np.asarray([0.5, 0.5, 0.0]),
+                ),
+            ],
+        )
+        nodes = [
+            {
+                "node_id": 0,
+                "label": "vegetation",
+                "world_center": [110.0, 100.0],
+            },
+            {
+                "node_id": 1,
+                "label": "vegetation",
+                "world_center": [103.0, 100.0],
+            },
+            {
+                "node_id": 2,
+                "label": "pole",
+                "world_center": [106.0, 100.0],
+            },
+        ]
+        assignments = _assignments(pose, None, nodes)
+        self.assertTrue(assignments[0]["grounded"])
+        self.assertEqual(assignments[0]["matched_node"], 1)
+        self.assertFalse(assignments[1]["grounded"])
+        self.assertIsNone(assignments[1]["matched_node"])
+
+    def test_query_format_matches_released_double_space_after_image(self):
+        pose = SimpleNamespace(descriptions=[_description()])
+        self.assertEqual(
+            f"<image>{_query_message(pose)}",
+            "<image>  The target location is north of a green vegetation.",
+        )
+
+    def test_ordered_loader_accepts_original_short_scene_metadata(self):
+        root, directory = _temporary_directory()
+        try:
+            scene = "2013_05_28_drive_0003_sync"
+            (directory / "poses").mkdir()
+            (directory / "cells").mkdir()
+            (directory / "poses" / f"{scene}.pkl").touch()
+            (directory / "cells" / f"{scene}.pkl").touch()
+            pose = SimpleNamespace(scene_name="0003")
+            cell = SimpleNamespace(
+                scene_name="0003", id="0003_00000"
+            )
+            with patch(
+                "evaluation.vlmloc_kitti360pose._load_pickle",
+                side_effect=[[pose], [cell]],
+            ):
+                dataset = load_ordered_dataset(directory, [scene])
+            self.assertEqual(dataset.all_poses, [pose])
+            self.assertEqual(dataset.all_cells, [cell])
+        finally:
+            shutil.rmtree(directory)
+            try:
+                root.rmdir()
+            except OSError:
+                pass
 
     def test_world_metric_counts_invalid_generation_as_miss(self):
         root, directory = _temporary_directory()
@@ -255,6 +500,75 @@ class Table8LikePipelineTests(unittest.TestCase):
             self.assertEqual(result["recall"]["5"], 0.5)
             self.assertEqual(result["recall"]["10"], 0.5)
             self.assertEqual(result["recall"]["15"], 0.5)
+            self.assertEqual(
+                result["candidate_geometry_upper_bound_recall"]["5"],
+                1.0,
+            )
+        finally:
+            shutil.rmtree(directory)
+            try:
+                root.rmdir()
+            except OSError:
+                pass
+
+    def test_merged_full_checkpoint_audit_proves_lora_application(self):
+        root, directory = _temporary_directory()
+        try:
+            adapter = directory / "adapter"
+            base = directory / "base"
+            merged = directory / "merged"
+            _write_fake_adapter(adapter)
+            _write_fake_full_model(base, b"\x00" * 16, revision=True)
+            _write_fake_full_model(merged, b"\x03" * 16)
+            smoke_row = {
+                "id": "test_000000",
+                "response": json.dumps({"point_2d": [111, 112]}),
+            }
+            adapter_smoke = directory / "adapter_smoke.jsonl"
+            merged_smoke = directory / "merged_smoke.jsonl"
+            adapter_smoke.write_text(
+                json.dumps(smoke_row) + "\n", encoding="utf-8"
+            )
+            merged_smoke.write_text(
+                json.dumps(smoke_row) + "\n", encoding="utf-8"
+            )
+            report_path = audit_vlmloc_merged_checkpoint(
+                adapter_dir=adapter,
+                base_model_dir=base,
+                merged_model_dir=merged,
+                adapter_smoke_predictions_path=adapter_smoke,
+                merged_smoke_predictions_path=merged_smoke,
+                output_dir=directory / "audit",
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(report["compatible"])
+            self.assertTrue(
+                report["checks"]["sampled_lora_targets_changed_from_base"]
+            )
+            self.assertEqual(
+                report["merged_model_audit"]["lora_tensor_keys"], []
+            )
+        finally:
+            shutil.rmtree(directory)
+            try:
+                root.rmdir()
+            except OSError:
+                pass
+
+    def test_full_checkpoint_inspection_rejects_adapter_artifacts(self):
+        root, directory = _temporary_directory()
+        try:
+            merged = directory / "merged"
+            _write_fake_full_model(merged, b"\x03" * 16)
+            (merged / "adapter_config.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            audit = inspect_full_model(merged)
+            self.assertEqual(
+                audit["adapter_artifacts_present"], ["adapter_config.json"]
+            )
+            self.assertEqual(audit["lora_tensor_keys"], [])
+            self.assertEqual(audit["header_tensor_key_count"], 1)
         finally:
             shutil.rmtree(directory)
             try:

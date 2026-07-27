@@ -1,9 +1,10 @@
 """Prepare and score the Table-8-like KITTI360Pose VLM-Loc fine stage.
 
 The public VLM-Loc release only provides CityLoc 50 m data/adapters.  This
-module creates a separate 30 m training/validation/test dataset from the
-ordered local KITTI360Pose pickles.  Test examples use the exact CMMLoc Top-1
-candidate stored in the checksummed Table-8-like manifest.
+module creates a separate bundle of VLM input representations (BEV images and
+JSON prompts) from the ordered local KITTI360Pose pickles.  It does not create
+new KITTI360Pose samples or modify the source dataset.  Test examples use the
+exact CMMLoc Top-1 candidate stored in the checksummed Table-8-like manifest.
 
 The local processed cells do not contain the dense ``xyz_raw``/``rgb_raw``
 fields used by the public CityLoc renderer.  Images generated here therefore
@@ -33,8 +34,10 @@ from evaluation.table8_like_protocol import (
 )
 from evaluation.vlmloc_release import (
     QWEN3_VL_8B_ARCHITECTURE,
+    audit_merged_lora_application,
     inspect_adapter,
     inspect_base_model,
+    inspect_full_model,
     inspect_official_source,
     inspect_python_environment,
 )
@@ -44,6 +47,12 @@ IMAGE_SIZE = 224
 BEV_RANGE_M = 30.0
 METERS_PER_PIXEL = BEV_RANGE_M / IMAGE_SIZE
 RENDERER_NAME = "processed_cell_downsampled_points_v1"
+DENSE_RAW_RENDERER_NAME = (
+    "official_dense_raw_points_on_origin_kitti360pose_cells_v1"
+)
+SUPPORTED_RENDERERS = frozenset(
+    {RENDERER_NAME, DENSE_RAW_RENDERER_NAME}
+)
 SCENE_NAMES_TRAIN = (
     "2013_05_28_drive_0000_sync",
     "2013_05_28_drive_0002_sync",
@@ -99,6 +108,67 @@ def _write_json_atomic(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _assert_separate_derived_output(
+    *,
+    data_root: Path,
+    output_dir: Path,
+    raw_kitti360_root: Path | None,
+) -> None:
+    """Fail closed if generated VLM inputs could overlap source data."""
+
+    source_roots = [("KITTI360Pose", Path(data_root).resolve())]
+    if raw_kitti360_root is not None:
+        source_roots.append(
+            ("raw KITTI-360", Path(raw_kitti360_root).resolve())
+        )
+    resolved_output = Path(output_dir).resolve()
+    for label, source_root in source_roots:
+        if _path_is_within(resolved_output, source_root) or _path_is_within(
+            source_root, resolved_output
+        ):
+            raise RuntimeError(
+                "VLM-Loc derived output must be separate from the "
+                f"{label} source tree: output={resolved_output}, "
+                f"source={source_root}"
+            )
+
+
+def _source_tree_metadata_snapshot(root: Path) -> dict[str, Any]:
+    """Fingerprint names/sizes/timestamps without reading 19 GB of payloads."""
+
+    root = Path(root).resolve()
+    digest = hashlib.sha256()
+    file_count = 0
+    byte_count = 0
+    for path in sorted(
+        (candidate for candidate in root.rglob("*") if candidate.is_file()),
+        key=lambda candidate: candidate.relative_to(root).as_posix(),
+    ):
+        stat = path.stat()
+        relative = path.relative_to(root).as_posix()
+        digest.update(
+            (
+                f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n"
+            ).encode("utf-8")
+        )
+        file_count += 1
+        byte_count += stat.st_size
+    return {
+        "root": str(root),
+        "file_count": file_count,
+        "byte_count": byte_count,
+        "relative_path_size_mtime_sha256": digest.hexdigest(),
+    }
+
+
 def _load_pickle(path: Path) -> Any:
     # Import lazily so geometry/projection unit tests do not require OpenCV.
     from dataloading.kitti360pose.compat import (
@@ -124,9 +194,17 @@ def load_ordered_dataset(
             )
         scene_poses = list(_load_pickle(pose_path))
         scene_cells = list(_load_pickle(cell_path))
-        if any(str(pose.scene_name) != scene for pose in scene_poses):
+        scene_short = scene.split("_")[-2]
+        accepted_scene_names = {scene, scene_short}
+        if any(
+            str(pose.scene_name) not in accepted_scene_names
+            for pose in scene_poses
+        ):
             raise RuntimeError(f"pose scene metadata mismatch in {pose_path}")
-        if any(str(cell.scene_name) != scene for cell in scene_cells):
+        if any(
+            str(cell.scene_name) not in accepted_scene_names
+            for cell in scene_cells
+        ):
             raise RuntimeError(f"cell scene metadata mismatch in {cell_path}")
         poses.extend(scene_poses)
         cells.extend(scene_cells)
@@ -209,7 +287,7 @@ def render_processed_cell(
     cell: Any, *, image_size: int = IMAGE_SIZE
 ) -> tuple[np.ndarray, dict[str, Any]]:
     image = np.full((image_size, image_size, 3), 255, dtype=np.uint8)
-    entries: list[tuple[bool, np.ndarray, np.ndarray, Any]] = []
+    entries: list[tuple[bool, np.ndarray, Any]] = []
     raw_attribute_count = 0
     point_count = 0
     for obj in cell.objects:
@@ -226,12 +304,10 @@ def render_processed_cell(
         np.clip(y0, 0, image_size - 1, out=y0)
         y = (image_size - 1) - y0
         linear = np.unique(y * image_size + x)
-        center_xy = np.mean(xy, axis=0)
         entries.append(
             (
                 str(obj.label) in STUFF_CLASSES,
                 linear,
-                center_xy,
                 obj,
             )
         )
@@ -241,19 +317,30 @@ def render_processed_cell(
     ordered = [entry for entry in entries if entry[0]]
     ordered.extend(entry for entry in entries if not entry[0])
     flat = image.reshape(-1, 3)
-    for _, linear, _, obj in ordered:
-        flat[linear] = _rgb_u8(obj.rgb)
-
     nodes = []
-    for node_id, (_, _, center_xy, obj) in enumerate(entries):
-        px, py = normalized_xy_to_pixel(
-            center_xy, image_size=image_size, clip=True
+    for node_id, (_, linear, obj) in enumerate(ordered):
+        flat[linear] = _rgb_u8(obj.rgb)
+        ys = (linear // image_size).astype(np.float64)
+        xs = (linear % image_size).astype(np.float64)
+        x_mean = float(np.mean(xs))
+        y_mean = float(np.mean(ys))
+        world_center = pixel_to_world_xy(
+            (x_mean, y_mean),
+            cell.bbox_w,
+            image_size=image_size,
         )
         nodes.append(
             {
                 "node_id": node_id,
                 "label": str(obj.label).lower(),
-                "pixel_center": [px, py],
+                "pixel_center": [
+                    int(round(x_mean)),
+                    int(round(y_mean)),
+                ],
+                "world_center": [
+                    float(world_center[0]),
+                    float(world_center[1]),
+                ],
                 "object_id": str(obj.id),
                 "instance_id": str(obj.instance_id),
             }
@@ -264,6 +351,358 @@ def render_processed_cell(
         "rendered_object_count": len(entries),
         "downsampled_point_count": point_count,
         "objects_with_raw_attributes": raw_attribute_count,
+    }
+
+
+def _raw_semantic_scene_directory(
+    raw_kitti360_root: Path, scene: str
+) -> Path:
+    root = Path(raw_kitti360_root).resolve()
+    candidates = (
+        root / "data_3d_semantics" / scene / "static",
+        root / "data_3d_semantics" / "train" / scene / "static",
+        root / "data_3d_semantics" / "test" / scene / "static",
+        root / scene / "static",
+    )
+    matches = [
+        candidate
+        for candidate in candidates
+        if candidate.is_dir() and any(candidate.glob("*.ply"))
+    ]
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            "Expected exactly one KITTI-360 semantic PLY directory for "
+            f"{scene}; checked {[str(path) for path in candidates]}, "
+            f"found {[str(path) for path in matches]}."
+        )
+    return matches[0]
+
+
+def _required_raw_object_keys(
+    cells: Sequence[Any],
+) -> set[tuple[str, int]]:
+    return {
+        (str(obj.label).lower(), int(obj.instance_id))
+        for cell in cells
+        for obj in cell.objects
+    }
+
+
+def _load_raw_scene_objects(
+    raw_kitti360_root: Path,
+    scene: str,
+    cells: Sequence[Any],
+) -> tuple[dict[tuple[str, int], tuple[np.ndarray, np.ndarray]], dict[str, Any]]:
+    try:
+        from plyfile import PlyData
+    except ImportError as error:
+        raise RuntimeError(
+            "Dense VLM-Loc rendering requires plyfile. Install it in the "
+            "VLM environment with: python -m pip install plyfile"
+        ) from error
+
+    from datapreparation.kitti360pose.utils import CLASS_TO_LABEL
+
+    required = _required_raw_object_keys(cells)
+    label_to_semantic = {
+        str(label).lower(): int(semantic)
+        for label, semantic in CLASS_TO_LABEL.items()
+    }
+    unknown_labels = sorted(
+        label for label, _ in required if label not in label_to_semantic
+    )
+    if unknown_labels:
+        raise RuntimeError(
+            f"Raw KITTI-360 semantic mapping lacks labels: {unknown_labels}"
+        )
+    required_by_semantic: dict[int, set[int]] = {}
+    key_by_numeric: dict[tuple[int, int], tuple[str, int]] = {}
+    for label, instance_id in required:
+        semantic = label_to_semantic[label]
+        required_by_semantic.setdefault(semantic, set()).add(instance_id)
+        key_by_numeric[(semantic, instance_id)] = (label, instance_id)
+
+    scene_dir = _raw_semantic_scene_directory(
+        raw_kitti360_root, scene
+    )
+    ply_paths = sorted(scene_dir.glob("*.ply"))
+    xyz_parts: dict[tuple[str, int], list[np.ndarray]] = {
+        key: [] for key in required
+    }
+    rgb_parts: dict[tuple[str, int], list[np.ndarray]] = {
+        key: [] for key in required
+    }
+    inventory = []
+    total_vertices = 0
+    selected_vertices = 0
+    required_fields = {
+        "x",
+        "y",
+        "z",
+        "red",
+        "green",
+        "blue",
+        "semantic",
+        "instance",
+    }
+    for ply_path in ply_paths:
+        vertex = PlyData.read(str(ply_path))["vertex"].data
+        fields = set(vertex.dtype.names or ())
+        missing_fields = sorted(required_fields - fields)
+        if missing_fields:
+            raise RuntimeError(
+                f"{ply_path} lacks required vertex fields: {missing_fields}"
+            )
+        semantic = np.asarray(vertex["semantic"], dtype=np.int64)
+        instance = np.asarray(vertex["instance"], dtype=np.int64)
+        total_vertices += len(vertex)
+        selected_mask = np.zeros(len(vertex), dtype=bool)
+        for semantic_id, instance_ids in required_by_semantic.items():
+            selected_mask |= (semantic == semantic_id) & np.isin(
+                instance,
+                np.fromiter(instance_ids, dtype=np.int64),
+            )
+        selected_indices = np.flatnonzero(selected_mask)
+        selected_vertices += len(selected_indices)
+        if len(selected_indices):
+            selected_semantic = semantic[selected_indices]
+            selected_instance = instance[selected_indices]
+            numeric_pairs = np.unique(
+                np.column_stack(
+                    (selected_semantic, selected_instance)
+                ),
+                axis=0,
+            )
+            for semantic_id, instance_id in numeric_pairs:
+                key = key_by_numeric.get(
+                    (int(semantic_id), int(instance_id))
+                )
+                if key is None:
+                    continue
+                pair_mask = (
+                    (selected_semantic == semantic_id)
+                    & (selected_instance == instance_id)
+                )
+                rows = selected_indices[pair_mask]
+                xyz_parts[key].append(
+                    np.column_stack(
+                        (
+                            vertex["x"][rows],
+                            vertex["y"][rows],
+                            vertex["z"][rows],
+                        )
+                    ).astype(np.float32, copy=False)
+                )
+                rgb_parts[key].append(
+                    np.column_stack(
+                        (
+                            vertex["red"][rows],
+                            vertex["green"][rows],
+                            vertex["blue"][rows],
+                        )
+                    ).astype(np.uint8, copy=False)
+                )
+        stat = ply_path.stat()
+        inventory.append(
+            {
+                "path": str(ply_path.resolve()),
+                "size_bytes": stat.st_size,
+                "vertex_count": len(vertex),
+            }
+        )
+
+    missing_keys = sorted(
+        f"{label}:{instance_id}"
+        for (label, instance_id), parts in xyz_parts.items()
+        if not parts
+    )
+    if missing_keys:
+        raise RuntimeError(
+            f"Raw KITTI-360 files for {scene} lack required objects: "
+            f"{missing_keys[:30]}"
+        )
+    raw_objects = {
+        key: (
+            np.concatenate(xyz_parts[key], axis=0),
+            np.concatenate(rgb_parts[key], axis=0),
+        )
+        for key in required
+    }
+    inventory_signature = hashlib.sha256(
+        json.dumps(
+            inventory,
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return raw_objects, {
+        "scene": scene,
+        "semantic_directory": str(scene_dir.resolve()),
+        "ply_file_count": len(ply_paths),
+        "total_vertex_count": total_vertices,
+        "selected_vertex_count": selected_vertices,
+        "required_object_key_count": len(required),
+        "inventory_metadata_sha256": inventory_signature,
+        "inventory_is_content_hash": False,
+        "files": inventory,
+    }
+
+
+def _world_points_to_linear_pixels(
+    xyz: np.ndarray,
+    bbox_w: np.ndarray,
+    image_size: int,
+) -> np.ndarray:
+    points = np.asarray(xyz, dtype=np.float64)
+    bbox = np.asarray(bbox_w, dtype=np.float64)
+    spans = bbox[3:5] - bbox[0:2]
+    if points.ndim != 2 or points.shape[1] < 2 or not len(points):
+        return np.empty(0, dtype=np.int64)
+    if np.any(spans <= 0):
+        raise RuntimeError(f"invalid cell bbox: {bbox.tolist()}")
+    x = np.floor(
+        (points[:, 0] - bbox[0]) * image_size / spans[0] - 1e-9
+    ).astype(np.int64)
+    y_unflipped = np.floor(
+        (points[:, 1] - bbox[1]) * image_size / spans[1] - 1e-9
+    ).astype(np.int64)
+    np.clip(x, 0, image_size - 1, out=x)
+    np.clip(y_unflipped, 0, image_size - 1, out=y_unflipped)
+    y = (image_size - 1) - y_unflipped
+    return np.unique(y * image_size + x)
+
+
+def render_dense_raw_cell(
+    cell: Any,
+    raw_scene_objects: Mapping[
+        tuple[str, int], tuple[np.ndarray, np.ndarray]
+    ],
+    *,
+    image_size: int = IMAGE_SIZE,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    bbox = np.asarray(cell.bbox_w, dtype=np.float64)
+    image = np.full((image_size, image_size, 3), 255, dtype=np.uint8)
+    object_groups: dict[tuple[str, int], list[Any]] = {}
+    for obj in cell.objects:
+        object_groups.setdefault(
+            (str(obj.label).lower(), int(obj.instance_id)), []
+        ).append(obj)
+
+    object_raw: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for key, objects in object_groups.items():
+        raw_xyz, raw_rgb = raw_scene_objects[key]
+        label = key[0]
+        if label not in STUFF_CLASSES:
+            if len(objects) != 1:
+                raise RuntimeError(
+                    "Multiple non-stuff objects share one semantic/instance "
+                    f"key in cell {cell.id}: {key}"
+                )
+            object_raw[id(objects[0])] = (raw_xyz, raw_rgb)
+            continue
+
+        try:
+            from sklearn.neighbors import KDTree
+        except ImportError as error:
+            raise RuntimeError(
+                "Dense VLM-Loc rendering requires scikit-learn for the same "
+                "nearest-cluster assignment used by the public source."
+            ) from error
+
+        inside = np.bitwise_and.reduce(
+            (
+                raw_xyz[:, 0] >= bbox[0],
+                raw_xyz[:, 1] >= bbox[1],
+                raw_xyz[:, 2] >= bbox[2],
+                raw_xyz[:, 0] <= bbox[3],
+                raw_xyz[:, 1] <= bbox[4],
+                raw_xyz[:, 2] <= bbox[5],
+            )
+        )
+        cropped_xyz = raw_xyz[inside]
+        cropped_rgb = raw_rgb[inside]
+        if not len(cropped_xyz):
+            raise RuntimeError(
+                f"Raw stuff object {key} has no points in cell {cell.id}"
+            )
+        cluster_points = []
+        cluster_ids = []
+        for cluster_id, obj in enumerate(objects):
+            normalized = np.asarray(obj.xyz, dtype=np.float64)
+            world = normalized * float(cell.cell_size) + bbox[0:3]
+            cluster_points.append(world[:, :2])
+            cluster_ids.extend([cluster_id] * len(world))
+        tree = KDTree(np.concatenate(cluster_points, axis=0))
+        nearest = tree.query(
+            cropped_xyz[:, :2], k=1, return_distance=False
+        )[:, 0]
+        assignments = np.asarray(cluster_ids, dtype=np.int64)[nearest]
+        for cluster_id, obj in enumerate(objects):
+            selected = assignments == cluster_id
+            if not np.any(selected):
+                raise RuntimeError(
+                    f"Raw cluster mapping produced no points for object "
+                    f"{obj.id} in cell {cell.id}"
+                )
+            object_raw[id(obj)] = (
+                cropped_xyz[selected],
+                cropped_rgb[selected],
+            )
+
+    entries = []
+    dense_point_count = 0
+    for obj in cell.objects:
+        xyz, rgb = object_raw[id(obj)]
+        linear = _world_points_to_linear_pixels(
+            xyz, bbox, image_size
+        )
+        if not len(linear):
+            continue
+        entries.append(
+            (
+                str(obj.label).lower() in STUFF_CLASSES,
+                linear,
+                _rgb_u8(rgb),
+                obj,
+            )
+        )
+        dense_point_count += len(xyz)
+
+    ordered = [entry for entry in entries if entry[0]]
+    ordered.extend(entry for entry in entries if not entry[0])
+    flat = image.reshape(-1, 3)
+    nodes = []
+    for node_id, (_, linear, color, obj) in enumerate(ordered):
+        flat[linear] = color
+        ys = (linear // image_size).astype(np.float64)
+        xs = (linear % image_size).astype(np.float64)
+        x_mean = float(np.mean(xs))
+        y_mean = float(np.mean(ys))
+        world_center = pixel_to_world_xy(
+            (x_mean, y_mean), bbox, image_size=image_size
+        )
+        nodes.append(
+            {
+                "node_id": node_id,
+                "label": str(obj.label).lower(),
+                "pixel_center": [
+                    int(round(x_mean)),
+                    int(round(y_mean)),
+                ],
+                "world_center": [
+                    float(world_center[0]),
+                    float(world_center[1]),
+                ],
+                "object_id": str(obj.id),
+                "instance_id": str(obj.instance_id),
+            }
+        )
+    return image, {
+        "nodes": nodes,
+        "object_count": len(cell.objects),
+        "rendered_object_count": len(entries),
+        "dense_raw_point_count": dense_point_count,
+        "raw_object_key_count": len(object_groups),
     }
 
 
@@ -283,36 +722,56 @@ def _query_message(pose: Any) -> str:
         f"{description.object_color_text} {description.object_label}"
         for description in pose.descriptions
     ]
-    return f" The target location is {_join_phrases(phrases)}."
+    # Match the released ms-swift dataset items exactly: create_train_info()
+    # adds one leading space to a user_message that already begins with one.
+    return f"  The target location is {_join_phrases(phrases)}."
 
 
 def _assignments(pose: Any, cell: Any, nodes: Sequence[dict[str, Any]]):
-    node_by_object_id = {
-        (node["label"], node["object_id"]): node for node in nodes
-    }
-    nodes_by_instance: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    del cell
+    nodes_by_label: dict[str, list[dict[str, Any]]] = {}
     for node in nodes:
-        nodes_by_instance.setdefault(
-            (node["label"], node["instance_id"]), []
-        ).append(node)
+        nodes_by_label.setdefault(node["label"], []).append(node)
 
     assignments = []
     for description in pose.descriptions:
         label = str(description.object_label).lower()
+        candidates = nodes_by_label.get(label, [])
         node = None
-        object_id = getattr(description, "object_id", None)
-        if object_id is not None:
-            node = node_by_object_id.get((label, str(object_id)))
-        if node is None:
-            candidates = nodes_by_instance.get(
-                (
-                    label,
-                    str(getattr(description, "object_instance_id", "")),
-                ),
-                [],
+        best_distance = math.inf
+        object_center = getattr(description, "object_center", None)
+        if candidates and object_center is not None:
+            center_in_pose_cell = np.asarray(
+                object_center, dtype=np.float64
+            )[:2]
+            object_center_world = (
+                center_in_pose_cell * BEV_RANGE_M
+                + np.asarray(pose.pose_w[:2], dtype=np.float64)
+                - BEV_RANGE_M / 2.0
             )
-            if candidates:
-                node = candidates[0]
+            distances = [
+                float(
+                    np.linalg.norm(
+                        np.asarray(
+                            candidate["world_center"],
+                            dtype=np.float64,
+                        )
+                        - object_center_world
+                    )
+                )
+                for candidate in candidates
+            ]
+            best_index = int(np.argmin(distances))
+            best_distance = distances[best_index]
+            threshold = (
+                50.0
+                if label == "road"
+                else 15.0
+                if label in STUFF_CLASSES
+                else 5.0
+            )
+            if best_distance <= threshold:
+                node = candidates[best_index]
         assignments.append(
             {
                 "object_label": str(description.object_label),
@@ -389,11 +848,22 @@ def _render_cell_once(
     *,
     image_root: Path,
     overwrite: bool,
+    raw_scene_objects: Mapping[
+        tuple[str, int], tuple[np.ndarray, np.ndarray]
+    ]
+    | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     scene_dir = image_root / str(cell.scene_name)
     scene_dir.mkdir(parents=True, exist_ok=True)
     image_path = scene_dir / f"{cell.id}.png"
-    image, info = render_processed_cell(cell)
+    if raw_scene_objects is None:
+        image, info = render_processed_cell(cell)
+        info["renderer"] = RENDERER_NAME
+    else:
+        image, info = render_dense_raw_cell(
+            cell, raw_scene_objects
+        )
+        info["renderer"] = DENSE_RAW_RENDERER_NAME
     if overwrite or not image_path.is_file():
         Image.fromarray(image, mode="RGB").save(image_path)
     else:
@@ -412,23 +882,41 @@ def _prepare_gt_split(
     output_dir: Path,
     split_name: str,
     overwrite_images: bool,
+    raw_kitti360_root: Path | None,
 ) -> tuple[Path, dict[str, Any]]:
-    image_root = output_dir / "images" / split_name
+    renderer_name = (
+        DENSE_RAW_RENDERER_NAME
+        if raw_kitti360_root is not None
+        else RENDERER_NAME
+    )
+    image_root = output_dir / "images" / renderer_name / split_name
     samples = []
     outside_count = 0
     cell_count = 0
     sample_index = 0
+    raw_scene_audits = []
     # Keep only one scene's point arrays in memory at a time. The JSON sample
     # order remains the declared split order.
     for scene in scenes:
         dataset = load_ordered_dataset(data_root, [scene])
         cells = {str(cell.id): cell for cell in dataset.all_cells}
+        raw_scene_objects = None
+        if raw_kitti360_root is not None:
+            raw_scene_objects, raw_scene_audit = (
+                _load_raw_scene_objects(
+                    raw_kitti360_root,
+                    scene,
+                    dataset.all_cells,
+                )
+            )
+            raw_scene_audits.append(raw_scene_audit)
         rendered: dict[str, tuple[Path, dict[str, Any]]] = {}
         for cell in dataset.all_cells:
             rendered[str(cell.id)] = _render_cell_once(
                 cell,
                 image_root=image_root,
                 overwrite=overwrite_images,
+                raw_scene_objects=raw_scene_objects,
             )
         cell_count += len(dataset.all_cells)
         for pose in dataset.all_poses:
@@ -465,6 +953,7 @@ def _prepare_gt_split(
         "cell_count": cell_count,
         "dataset_json_path": str(json_path.resolve()),
         "dataset_json_sha256": _sha256_file(json_path),
+        "raw_scene_audits": raw_scene_audits,
     }
     return json_path, stats
 
@@ -475,6 +964,8 @@ def prepare_vlmloc_data(
     manifest_path: Path,
     output_dir: Path,
     overwrite_images: bool = False,
+    raw_kitti360_root: Path | None = None,
+    require_dense_raw: bool = False,
 ) -> Path:
     from datapreparation.kitti360pose import utils as source_utils
 
@@ -498,6 +989,22 @@ def prepare_vlmloc_data(
 
     data_root = Path(data_root).resolve()
     output_dir = Path(output_dir).resolve()
+    raw_kitti360_root = (
+        Path(raw_kitti360_root).resolve()
+        if raw_kitti360_root is not None
+        else None
+    )
+    _assert_separate_derived_output(
+        data_root=data_root,
+        output_dir=output_dir,
+        raw_kitti360_root=raw_kitti360_root,
+    )
+    if require_dense_raw and raw_kitti360_root is None:
+        raise RuntimeError(
+            "--require-dense-raw was requested but "
+            "--raw-kitti360-root was not provided."
+        )
+    source_snapshot_before = _source_tree_metadata_snapshot(data_root)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     training_path, training_stats = _prepare_gt_split(
@@ -506,6 +1013,7 @@ def prepare_vlmloc_data(
         output_dir=output_dir,
         split_name="training",
         overwrite_images=overwrite_images,
+        raw_kitti360_root=raw_kitti360_root,
     )
     validation_path, validation_stats = _prepare_gt_split(
         data_root,
@@ -513,6 +1021,7 @@ def prepare_vlmloc_data(
         output_dir=output_dir,
         split_name="validation",
         overwrite_images=overwrite_images,
+        raw_kitti360_root=raw_kitti360_root,
     )
 
     test_dataset = load_ordered_dataset(data_root, SCENE_NAMES_TEST)
@@ -528,14 +1037,50 @@ def prepare_vlmloc_data(
     cells = {str(cell.id): cell for cell in test_dataset.all_cells}
     candidate_ids = [row[0] for row in retrievals]
     unique_candidate_ids = list(dict.fromkeys(candidate_ids))
-    image_root = output_dir / "images" / "testing_cmmloc_top1"
+    selected_renderer_name = (
+        DENSE_RAW_RENDERER_NAME
+        if raw_kitti360_root is not None
+        else RENDERER_NAME
+    )
+    image_root = (
+        output_dir
+        / "images"
+        / selected_renderer_name
+        / "testing_cmmloc_top1"
+    )
     rendered = {}
-    for cell_id in unique_candidate_ids:
-        cell = cells[cell_id]
-        rendered[cell_id] = _render_cell_once(
-            cell,
-            image_root=image_root,
-            overwrite=overwrite_images,
+    testing_raw_scene_audits = []
+    for scene in SCENE_NAMES_TEST:
+        scene_short = scene.split("_")[-2]
+        scene_cell_ids = [
+            cell_id
+            for cell_id in unique_candidate_ids
+            if str(cells[cell_id].scene_name) in {scene, scene_short}
+        ]
+        if not scene_cell_ids:
+            continue
+        raw_scene_objects = None
+        if raw_kitti360_root is not None:
+            raw_scene_objects, raw_scene_audit = (
+                _load_raw_scene_objects(
+                    raw_kitti360_root,
+                    scene,
+                    [cells[cell_id] for cell_id in scene_cell_ids],
+                )
+            )
+            testing_raw_scene_audits.append(raw_scene_audit)
+        for cell_id in scene_cell_ids:
+            rendered[cell_id] = _render_cell_once(
+                cells[cell_id],
+                image_root=image_root,
+                overwrite=overwrite_images,
+                raw_scene_objects=raw_scene_objects,
+            )
+    missing_rendered = sorted(set(unique_candidate_ids) - set(rendered))
+    if missing_rendered:
+        raise RuntimeError(
+            "Candidate cells could not be associated with the declared "
+            f"test scenes: {missing_rendered[:30]}"
         )
 
     test_samples = []
@@ -558,6 +1103,7 @@ def prepare_vlmloc_data(
                 "query_index": query_index,
                 "query_scene": str(pose.scene_name),
                 "query_gt_cell_id": str(pose.cell_id),
+                "renderer": render_info["renderer"],
             }
         )
         outside_count += int(not index["target_inside_candidate"])
@@ -570,16 +1116,47 @@ def prepare_vlmloc_data(
     _write_json_atomic(testing_path, test_samples)
     _write_json_atomic(index_path, test_index)
     _write_json_atomic(smoke_path, test_samples[:1])
+    source_snapshot_after = _source_tree_metadata_snapshot(data_root)
+    if source_snapshot_after != source_snapshot_before:
+        raise RuntimeError(
+            "KITTI360Pose source tree changed while preparing VLM-Loc "
+            "derived inputs. The source dataset must remain immutable."
+        )
+    renderer_name = selected_renderer_name
     audit = {
         "schema_version": 1,
         "backend": "vlmloc_kitti360pose_30m_retrained",
         "comparison_scope": "table8_like_full_test_11505",
-        "renderer": RENDERER_NAME,
+        "source_dataset_immutability": {
+            "source_dataset_modified": False,
+            "new_kitti360pose_samples_added": 0,
+            "snapshot_before": source_snapshot_before,
+            "snapshot_after": source_snapshot_after,
+            "generated_files_are_derived_inputs_only": True,
+            "derived_output_root": str(output_dir),
+        },
+        "renderer": renderer_name,
         "renderer_exactly_matches_public_dense_raw_renderer": False,
         "renderer_reason": (
-            "The local processed KITTI360Pose cells contain normalized "
-            "downsampled xyz/rgb arrays but no xyz_raw/rgb_raw fields. The "
-            "adapter must be retrained on these generated images."
+            (
+                "Uses official KITTI-360 dense semantic/RGB points, public "
+                "stuff-before-object rasterization, footprint centroids, and "
+                "PNA thresholds while preserving the original ordered 30 m "
+                "KITTI360Pose cells. Raw stuff points are deterministically "
+                "mapped to the already-published cell clusters, so this is "
+                "closer to the paper but is not claimed to be the authors' "
+                "unreleased exact Table-8 generator."
+            )
+            if raw_kitti360_root is not None
+            else (
+                "The local processed KITTI360Pose cells contain normalized "
+                "downsampled xyz/rgb arrays but no xyz_raw/rgb_raw fields. "
+                "This fallback is not the closest-public-data renderer."
+            )
+        ),
+        "uses_dense_raw_kitti360_points": raw_kitti360_root is not None,
+        "raw_kitti360_root": (
+            str(raw_kitti360_root) if raw_kitti360_root else None
         ),
         "image_size_px": IMAGE_SIZE,
         "bev_range_m": BEV_RANGE_M,
@@ -598,6 +1175,7 @@ def prepare_vlmloc_data(
             "smoke_dataset_path": str(smoke_path.resolve()),
             "smoke_dataset_sha256": _sha256_file(smoke_path),
             "ordered_dataset_signature": signature,
+            "raw_scene_audits": testing_raw_scene_audits,
         },
         "cmmloc_manifest_path": str(Path(manifest_path).resolve()),
         "cmmloc_manifest_sha256": _sha256_file(Path(manifest_path)),
@@ -621,6 +1199,7 @@ def audit_vlmloc_runtime_preflight(
     data_dir: Path,
     smoke_predictions_path: Path,
     output_dir: Path,
+    require_dense_raw: bool = False,
 ) -> Path:
     """Audit a retrained adapter after a one-query ``swift infer`` smoke."""
 
@@ -696,9 +1275,11 @@ def audit_vlmloc_runtime_preflight(
         "training_target_modules": ["all-linear"],
         "training_freeze_vit": False,
         "training_freeze_aligner": False,
-        "training_num_epochs": 5.0,
+        "training_num_epochs": 2.0,
         "training_learning_rate": 1e-4,
-        "training_gradient_accumulation_steps": 2,
+        "training_attention_implementation": "flash_attn",
+        "training_per_device_batch_size": 1,
+        "training_gradient_accumulation_steps": 4,
         "training_seed": 42,
         "data_seed": 42,
     }
@@ -738,7 +1319,12 @@ def audit_vlmloc_runtime_preflight(
     checks = {
         "prepared_data_complete_and_hashes_match": bool(
             preparation
-            and preparation.get("renderer") == RENDERER_NAME
+            and preparation.get("renderer") in SUPPORTED_RENDERERS
+            and (
+                not require_dense_raw
+                or preparation.get("renderer")
+                == DENSE_RAW_RENDERER_NAME
+            )
             and preparation.get("testing", {}).get("sample_count")
             == QUERY_COUNT
             and data_hashes_match
@@ -785,6 +1371,7 @@ def audit_vlmloc_runtime_preflight(
         "python_environment_audit": environment,
         "preparation_audit_path": str(preparation_path),
         "preparation_audit": preparation,
+        "require_dense_raw": require_dense_raw,
         "prepared_data_files": data_file_audit,
         "prepared_data_recorded_hashes": recorded_hashes,
         "smoke_predictions_path": str(smoke_predictions_path),
@@ -818,9 +1405,18 @@ def audit_vlmloc_runtime_preflight(
             ),
         },
         "important_scope": (
-            "This validates the separately retrained Table-8-like 30 m "
-            "adapter and processed-point renderer, not the unavailable exact "
-            "Table-8 adapter/dense-raw renderer."
+            (
+                "This validates the separately retrained Table-8-like 30 m "
+                "adapter with official dense KITTI-360 points on the original "
+                "ordered KITTI360Pose cells. It is the closest audited public "
+                "path, not the unavailable authors' exact Table-8 adapter."
+            )
+            if preparation.get("renderer") == DENSE_RAW_RENDERER_NAME
+            else (
+                "This validates the separately retrained Table-8-like 30 m "
+                "adapter with the downsampled-point fallback, not the closest "
+                "dense-raw path or unavailable exact Table-8 adapter."
+            )
         ),
     }
     output_dir = Path(output_dir).resolve()
@@ -896,6 +1492,143 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def audit_vlmloc_merged_checkpoint(
+    *,
+    adapter_dir: Path,
+    base_model_dir: Path,
+    merged_model_dir: Path,
+    adapter_smoke_predictions_path: Path,
+    merged_smoke_predictions_path: Path,
+    output_dir: Path,
+) -> Path:
+    """Audit a standalone Qwen checkpoint produced by merging the LoRA."""
+
+    adapter_dir = Path(adapter_dir).resolve()
+    base_model_dir = Path(base_model_dir).resolve()
+    merged_model_dir = Path(merged_model_dir).resolve()
+    adapter_smoke_path = Path(adapter_smoke_predictions_path).resolve()
+    merged_smoke_path = Path(merged_smoke_predictions_path).resolve()
+
+    adapter = inspect_adapter(adapter_dir)
+    base = inspect_base_model(base_model_dir)
+    merged = inspect_full_model(merged_model_dir)
+    merge_application = audit_merged_lora_application(
+        adapter_dir=adapter_dir,
+        base_model_dir=base_model_dir,
+        merged_model_dir=merged_model_dir,
+        sample_count=5,
+    )
+    adapter_rows = (
+        _load_jsonl(adapter_smoke_path)
+        if adapter_smoke_path.is_file()
+        else []
+    )
+    merged_rows = (
+        _load_jsonl(merged_smoke_path)
+        if merged_smoke_path.is_file()
+        else []
+    )
+    adapter_point = (
+        _response_point(adapter_rows[0]) if len(adapter_rows) == 1 else None
+    )
+    merged_point = (
+        _response_point(merged_rows[0]) if len(merged_rows) == 1 else None
+    )
+    tensor_namespace_matches = bool(
+        base.get("base_tensor_key_sha256")
+        and base.get("base_tensor_key_sha256")
+        == merged.get("tensor_key_sha256")
+        and base.get("base_tensor_key_count")
+        == merged.get("header_tensor_key_count")
+    )
+    merged_inventory_complete = bool(
+        merged.get("architecture_matches_qwen3_vl_8b")
+        and int(merged.get("header_tensor_key_count") or 0) > 0
+        and not merged.get("missing_required_inference_files", ["missing"])
+        and not merged.get("missing_shards", ["missing"])
+        and not merged.get("declared_but_missing_header_keys", ["missing"])
+        and not merged.get("undeclared_header_keys", ["missing"])
+        and not merged.get("wrong_shard_keys", ["missing"])
+        and not merged.get("duplicate_header_keys", ["missing"])
+        and not merged.get("invalid_header_records", ["missing"])
+        and not merged.get("inventory_error")
+    )
+    checks = {
+        "source_lora_adapter_structure": bool(
+            adapter.get("adapter_config_exists")
+            and adapter.get("adapter_weights_exists")
+            and adapter.get("peft_type") == "LORA"
+            and adapter.get("task_type") == "CAUSAL_LM"
+            and not adapter.get("unpaired_lora_keys", ["missing"])
+            and not adapter.get("internal_shape_mismatches", ["missing"])
+        ),
+        "base_model_complete_and_qwen3_vl_8b": bool(
+            base.get("architecture_matches_qwen3_vl_8b")
+            and base.get("safetensors_index_exists")
+            and not base.get("missing_base_shards", ["missing"])
+            and base.get("revision_marker_exists")
+        ),
+        "merged_full_checkpoint_inventory": merged_inventory_complete,
+        "merged_tensor_namespace_matches_base": tensor_namespace_matches,
+        "merged_has_no_adapter_or_lora_tensor_namespace": bool(
+            not merged.get("adapter_artifacts_present", ["missing"])
+            and not merged.get("lora_tensor_keys", ["missing"])
+        ),
+        "sampled_lora_targets_changed_from_base": bool(
+            merge_application.get("compatible")
+        ),
+        "adapter_runtime_smoke": bool(
+            len(adapter_rows) == 1 and adapter_point is not None
+        ),
+        "merged_runtime_smoke": bool(
+            len(merged_rows) == 1 and merged_point is not None
+        ),
+        "merged_and_adapter_smoke_prediction_match": bool(
+            adapter_point is not None
+            and merged_point is not None
+            and np.allclose(adapter_point, merged_point, atol=0.0, rtol=0.0)
+        ),
+    }
+    report = {
+        "schema_version": 1,
+        "backend": "vlmloc_kitti360pose_30m_merged_full_checkpoint",
+        "adapter_audit": adapter,
+        "base_model_audit": base,
+        "merged_model_audit": merged,
+        "merge_application_audit": merge_application,
+        "adapter_smoke_predictions_path": str(adapter_smoke_path),
+        "adapter_smoke_predictions_sha256": (
+            _sha256_file(adapter_smoke_path)
+            if adapter_smoke_path.is_file()
+            else None
+        ),
+        "merged_smoke_predictions_path": str(merged_smoke_path),
+        "merged_smoke_predictions_sha256": (
+            _sha256_file(merged_smoke_path)
+            if merged_smoke_path.is_file()
+            else None
+        ),
+        "adapter_smoke_point_2d": (
+            list(adapter_point) if adapter_point is not None else None
+        ),
+        "merged_smoke_point_2d": (
+            list(merged_point) if merged_point is not None else None
+        ),
+        "checks": checks,
+        "compatible": all(checks.values()),
+        "checkpoint_kind": (
+            "standalone full-weight Hugging Face checkpoint for inference; "
+            "the separate LoRA training checkpoint is retained for resuming "
+            "training and provenance"
+        ),
+    }
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "vlmloc_merged_checkpoint_audit.json"
+    _write_json_atomic(report_path, report)
+    return report_path
+
+
 def evaluate_vlmloc_predictions(
     *,
     predictions_path: Path,
@@ -917,6 +1650,7 @@ def evaluate_vlmloc_predictions(
         )
 
     errors_m = []
+    candidate_min_errors_m = []
     invalid = 0
     per_query = []
     for index, (prediction, metadata) in enumerate(
@@ -931,14 +1665,26 @@ def evaluate_vlmloc_predictions(
             )
         point = _response_point(prediction)
         error_m = None
+        target_world = np.asarray(
+            metadata["pose_world_xy"], dtype=np.float64
+        )
+        candidate_bbox = np.asarray(
+            metadata["candidate_bbox_w"], dtype=np.float64
+        )
+        closest_in_candidate = np.clip(
+            target_world,
+            candidate_bbox[0:2],
+            candidate_bbox[3:5],
+        )
+        candidate_min_error = float(
+            np.linalg.norm(closest_in_candidate - target_world)
+        )
+        candidate_min_errors_m.append(candidate_min_error)
         if point is None:
             invalid += 1
         else:
             predicted_world = pixel_to_world_xy(
                 point, metadata["candidate_bbox_w"]
-            )
-            target_world = np.asarray(
-                metadata["pose_world_xy"], dtype=np.float64
             )
             error_m = float(np.linalg.norm(predicted_world - target_world))
             errors_m.append(error_m)
@@ -947,6 +1693,7 @@ def evaluate_vlmloc_predictions(
                 "query_index": index,
                 "id": expected_id,
                 "candidate_cell_id": metadata["candidate_cell_id"],
+                "candidate_min_possible_error_m": candidate_min_error,
                 "valid_prediction": error_m is not None,
                 "error_m": error_m,
             }
@@ -961,6 +1708,32 @@ def evaluate_vlmloc_predictions(
         for threshold in (5, 10, 15)
     }
     paper_reference = {"5": 0.4036, "10": 0.5169, "15": 0.5474}
+    paper_query_count = 11_404
+    added_query_count = (
+        total - paper_query_count if total >= paper_query_count else None
+    )
+    sample_count_only_envelope = (
+        {
+            threshold: {
+                "approx_min_recall_if_all_added_queries_fail": (
+                    reference * paper_query_count / total
+                ),
+                "approx_max_recall_if_all_added_queries_succeed": (
+                    reference * paper_query_count + added_query_count
+                )
+                / total,
+            }
+            for threshold, reference in paper_reference.items()
+        }
+        if added_query_count is not None
+        else None
+    )
+    renderers = sorted(
+        {
+            str(row.get("renderer", "unknown"))
+            for row in test_index
+        }
+    )
     result = {
         "schema_version": 1,
         "backend": "vlmloc_kitti360pose_30m_retrained",
@@ -972,16 +1745,35 @@ def evaluate_vlmloc_predictions(
         "metric": "world-coordinate localization recall",
         "thresholds_m": [5, 10, 15],
         "recall": metrics,
+        "candidate_geometry_upper_bound_recall": {
+            str(threshold): sum(
+                error <= threshold for error in candidate_min_errors_m
+            )
+            / total
+            for threshold in (5, 10, 15)
+        },
         "table8_reference_recall_not_exact_target": paper_reference,
+        "table8_reference_query_count": paper_query_count,
+        "additional_local_query_count": added_query_count,
+        "sample_count_only_reference_envelope_approximate": (
+            sample_count_only_envelope
+        ),
+        "sample_count_only_envelope_note": (
+            "This narrow envelope applies only if the original 11,404 "
+            "predictions are unchanged and the sole difference is appending "
+            "101 queries. It does not apply when the checkpoint, renderer, "
+            "CMMLoc candidates, or preprocessing differ."
+        ),
+        "renderers": renderers,
         "difference_from_table8_reference_percentage_points": {
             threshold: 100.0 * (metrics[threshold] - reference)
             for threshold, reference in paper_reference.items()
         },
         "comparison_warning": (
             "The reference uses the paper's 11,404-query/dense-raw-renderer "
-            "setup. This result uses all 11,505 local queries and a retrained "
-            "processed-point renderer, so closeness is a sanity check rather "
-            "than an exact reproduction criterion."
+            "setup. This result uses all 11,505 local queries and a separately "
+            "retrained checkpoint. Even with dense raw points, closeness is a "
+            "sanity check rather than an exact reproduction criterion."
         ),
         "mean_error_m_valid_only": (
             float(np.mean(errors_m)) if errors_m else None

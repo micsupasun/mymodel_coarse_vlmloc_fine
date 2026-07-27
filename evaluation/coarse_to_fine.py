@@ -74,6 +74,7 @@ from evaluation.table8_reproduction import (
 )
 from evaluation.table8_like_protocol import write_table8_like_manifest
 from evaluation.vlmloc_kitti360pose import (
+    audit_vlmloc_merged_checkpoint,
     audit_vlmloc_runtime_preflight,
     evaluate_vlmloc_predictions,
     prepare_vlmloc_data,
@@ -1455,25 +1456,38 @@ def command_table8_like_stage1(cli: argparse.Namespace) -> int:
 def command_table8_like_vlmloc_prepare(
     cli: argparse.Namespace,
 ) -> int:
-    """Create 30 m train/val/test VLM data from the CMMLoc Top-1 manifest."""
+    """Derive VLM inputs without modifying the KITTI360Pose source data."""
 
     audit_path = prepare_vlmloc_data(
         data_root=Path(cli.data_root),
         manifest_path=Path(cli.manifest),
         output_dir=Path(cli.output_dir),
         overwrite_images=cli.overwrite_images,
+        raw_kitti360_root=(
+            Path(cli.raw_kitti360_root)
+            if cli.raw_kitti360_root
+            else None
+        ),
+        require_dense_raw=cli.require_dense_raw,
     )
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
-    print(f"VLM-Loc 30 m data audit: {audit_path}")
+    print(f"VLM-Loc 30 m derived-input audit: {audit_path}")
     print(
         "Prepared samples: "
         f"train={audit['training']['sample_count']}, "
         f"validation={audit['validation']['sample_count']}, "
         f"test={audit['testing']['sample_count']}"
     )
+    print(f"Renderer: {audit['renderer']}")
     print(
-        "Renderer: processed-cell downsampled points. The VLM-Loc adapter "
-        "must be retrained on this data before fine inference."
+        "KITTI360Pose source modified: "
+        f"{audit['source_dataset_immutability']['source_dataset_modified']}; "
+        "new KITTI360Pose samples added: "
+        f"{audit['source_dataset_immutability']['new_kitti360pose_samples_added']}"
+    )
+    print(
+        "The VLM-Loc adapter must be retrained on these exact generated "
+        "images before fine inference."
     )
     return 0
 
@@ -1524,11 +1538,42 @@ def command_table8_like_vlmloc_preflight(
         data_dir=Path(cli.vlmloc_data_dir),
         smoke_predictions_path=Path(cli.smoke_predictions),
         output_dir=Path(cli.output_dir),
+        require_dense_raw=cli.require_dense_raw,
     )
     report = json.loads(report_path.read_text(encoding="utf-8"))
     for name, passed in report["checks"].items():
         print(f"{name}: {'PASS' if passed else 'FAIL'}")
     print(f"VLM-Loc runtime preflight: {report_path}")
+    return 0 if report["compatible"] else 2
+
+
+def command_table8_like_vlmloc_merged_preflight(
+    cli: argparse.Namespace,
+) -> int:
+    """Audit the standalone full checkpoint produced by merging the LoRA."""
+
+    checkpoint_root = Path(cli.checkpoint_root).resolve()
+    report_path = audit_vlmloc_merged_checkpoint(
+        adapter_dir=Path(cli.adapter_dir),
+        base_model_dir=(
+            checkpoint_root
+            / "VLM-Loc"
+            / "base_models"
+            / "Qwen3-VL-8B-Instruct"
+        ),
+        merged_model_dir=Path(cli.merged_model_dir),
+        adapter_smoke_predictions_path=Path(
+            cli.adapter_smoke_predictions
+        ),
+        merged_smoke_predictions_path=Path(
+            cli.merged_smoke_predictions
+        ),
+        output_dir=Path(cli.output_dir),
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    for name, passed in report["checks"].items():
+        print(f"{name}: {'PASS' if passed else 'FAIL'}")
+    print(f"VLM-Loc merged full-checkpoint audit: {report_path}")
     return 0 if report["compatible"] else 2
 
 
@@ -1862,6 +1907,22 @@ def build_parser() -> argparse.ArgumentParser:
     table8_like_vlmloc_prepare.add_argument(
         "--overwrite-images", action="store_true"
     )
+    table8_like_vlmloc_prepare.add_argument(
+        "--raw-kitti360-root",
+        help=(
+            "KITTI-360 root containing data_3d_semantics. When supplied, "
+            "render official dense RGB/semantic points while preserving the "
+            "ordered 30 m KITTI360Pose cells."
+        ),
+    )
+    table8_like_vlmloc_prepare.add_argument(
+        "--require-dense-raw",
+        action="store_true",
+        help=(
+            "Fail instead of falling back to downsampled cell points when "
+            "the raw KITTI-360 root is not supplied or incomplete."
+        ),
+    )
     table8_like_vlmloc_prepare.set_defaults(
         handler=command_table8_like_vlmloc_prepare,
         top_k=list(TABLE8_TOP_K),
@@ -1911,8 +1972,45 @@ def build_parser() -> argparse.ArgumentParser:
     table8_like_vlmloc_preflight.add_argument(
         "--output-dir", required=True
     )
+    table8_like_vlmloc_preflight.add_argument(
+        "--require-dense-raw",
+        action="store_true",
+        help=(
+            "Reject prepared data unless it used the audited dense raw "
+            "KITTI-360 renderer."
+        ),
+    )
     table8_like_vlmloc_preflight.set_defaults(
         handler=command_table8_like_vlmloc_preflight
+    )
+
+    table8_like_vlmloc_merged_preflight = subparsers.add_parser(
+        "table8-like-vlmloc-merged-preflight",
+        help=(
+            "Audit a standalone full Qwen checkpoint after merging the "
+            "KITTI360Pose LoRA, including tensor and runtime parity checks."
+        ),
+    )
+    table8_like_vlmloc_merged_preflight.add_argument(
+        "--checkpoint-root", required=True
+    )
+    table8_like_vlmloc_merged_preflight.add_argument(
+        "--adapter-dir", required=True
+    )
+    table8_like_vlmloc_merged_preflight.add_argument(
+        "--merged-model-dir", required=True
+    )
+    table8_like_vlmloc_merged_preflight.add_argument(
+        "--adapter-smoke-predictions", required=True
+    )
+    table8_like_vlmloc_merged_preflight.add_argument(
+        "--merged-smoke-predictions", required=True
+    )
+    table8_like_vlmloc_merged_preflight.add_argument(
+        "--output-dir", required=True
+    )
+    table8_like_vlmloc_merged_preflight.set_defaults(
+        handler=command_table8_like_vlmloc_merged_preflight
     )
 
     stage1 = subparsers.add_parser("stage1")

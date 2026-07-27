@@ -138,6 +138,274 @@ def read_safetensors_header(path: Path) -> dict[str, Any]:
     return header
 
 
+def _string_set_sha256(values: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    for value in sorted(set(values)):
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _model_weight_inventory(
+    model_dir: Path,
+) -> tuple[dict[str, str], dict[str, dict[str, Any]], dict[str, Any]]:
+    """Read a sharded/full safetensors namespace without loading tensors."""
+
+    model_dir = Path(model_dir).resolve()
+    index_path = model_dir / "model.safetensors.index.json"
+    single_path = model_dir / "model.safetensors"
+    declared_weight_map: dict[str, str] = {}
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        raw_weight_map = index.get("weight_map")
+        if not isinstance(raw_weight_map, dict):
+            raise ValueError(f"{index_path} has no object weight_map")
+        declared_weight_map = {
+            str(key): str(value) for key, value in raw_weight_map.items()
+        }
+    elif single_path.is_file():
+        header = read_safetensors_header(single_path)
+        declared_weight_map = {
+            str(key): single_path.name
+            for key in header
+            if key != "__metadata__"
+        }
+
+    shard_names = sorted(set(declared_weight_map.values()))
+    missing_shards = [
+        name for name in shard_names if not (model_dir / name).is_file()
+    ]
+    tensor_metadata: dict[str, dict[str, Any]] = {}
+    duplicate_header_keys: list[str] = []
+    invalid_header_records: list[str] = []
+    actual_key_to_shard: dict[str, str] = {}
+    dtype_counts: dict[str, int] = {}
+    for shard_name in shard_names:
+        shard_path = model_dir / shard_name
+        if not shard_path.is_file():
+            continue
+        header = read_safetensors_header(shard_path)
+        for key, metadata in header.items():
+            if key == "__metadata__":
+                continue
+            if key in tensor_metadata:
+                duplicate_header_keys.append(key)
+                continue
+            if not isinstance(metadata, dict):
+                invalid_header_records.append(key)
+                continue
+            tensor_metadata[key] = metadata
+            actual_key_to_shard[key] = shard_name
+            dtype = str(metadata.get("dtype"))
+            dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+
+    declared_keys = set(declared_weight_map)
+    actual_keys = set(tensor_metadata)
+    wrong_shard = sorted(
+        key
+        for key in declared_keys & actual_keys
+        if declared_weight_map[key] != actual_key_to_shard[key]
+    )
+    summary = {
+        "index_exists": index_path.is_file(),
+        "single_safetensors_exists": single_path.is_file(),
+        "shard_names": shard_names,
+        "missing_shards": missing_shards,
+        "declared_tensor_key_count": len(declared_keys),
+        "header_tensor_key_count": len(actual_keys),
+        "declared_but_missing_header_keys": sorted(declared_keys - actual_keys),
+        "undeclared_header_keys": sorted(actual_keys - declared_keys),
+        "wrong_shard_keys": wrong_shard,
+        "duplicate_header_keys": sorted(duplicate_header_keys),
+        "invalid_header_records": sorted(invalid_header_records),
+        "tensor_dtype_counts": dict(sorted(dtype_counts.items())),
+        "tensor_key_sha256": _string_set_sha256(actual_keys),
+        "total_safetensors_bytes": sum(
+            (model_dir / name).stat().st_size
+            for name in shard_names
+            if (model_dir / name).is_file()
+        ),
+    }
+    return declared_weight_map, tensor_metadata, summary
+
+
+def inspect_full_model(model_dir: Path) -> dict[str, Any]:
+    """Audit a standalone full-weight Qwen checkpoint after LoRA merge."""
+
+    model_dir = Path(model_dir).resolve()
+    config_path = model_dir / "config.json"
+    required_inference_files = (
+        "config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+    )
+    record: dict[str, Any] = {
+        "model_dir": str(model_dir),
+        "config_exists": config_path.is_file(),
+        "missing_required_inference_files": [
+            name
+            for name in required_inference_files
+            if not (model_dir / name).is_file()
+        ],
+        "adapter_artifacts_present": [
+            name
+            for name in ("adapter_config.json", "adapter_model.safetensors")
+            if (model_dir / name).exists()
+        ],
+    }
+    if config_path.is_file():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        architectures = config.get("architectures") or []
+        record.update(
+            {
+                "model_type": config.get("model_type"),
+                "architectures": architectures,
+                "architecture_matches_qwen3_vl_8b": (
+                    QWEN3_VL_8B_ARCHITECTURE in architectures
+                ),
+                "config_sha256": sha256_file(config_path),
+            }
+        )
+    try:
+        _, metadata, inventory = _model_weight_inventory(model_dir)
+        record.update(inventory)
+        record["lora_tensor_keys"] = sorted(
+            key
+            for key in metadata
+            if ".lora_" in key.lower() or key.lower().endswith(".lora")
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        record["inventory_error"] = f"{type(error).__name__}: {error}"
+    return record
+
+
+def _tensor_payload_sha256(
+    model_dir: Path,
+    weight_map: dict[str, str],
+    metadata: dict[str, dict[str, Any]],
+    key: str,
+) -> str:
+    shard_path = Path(model_dir).resolve() / weight_map[key]
+    offsets = metadata[key].get("data_offsets")
+    if (
+        not isinstance(offsets, list)
+        or len(offsets) != 2
+        or not all(isinstance(value, int) for value in offsets)
+        or offsets[0] < 0
+        or offsets[1] < offsets[0]
+    ):
+        raise ValueError(f"invalid data_offsets for {key}: {offsets}")
+    with shard_path.open("rb") as handle:
+        raw_length = handle.read(8)
+        if len(raw_length) != 8:
+            raise ValueError(f"{shard_path} has no safetensors header length")
+        (header_length,) = struct.unpack("<Q", raw_length)
+        handle.seek(8 + header_length + offsets[0])
+        remaining = offsets[1] - offsets[0]
+        digest = hashlib.sha256()
+        while remaining:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError(f"truncated tensor payload for {key}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def audit_merged_lora_application(
+    *,
+    adapter_dir: Path,
+    base_model_dir: Path,
+    merged_model_dir: Path,
+    sample_count: int = 5,
+) -> dict[str, Any]:
+    """Verify sampled LoRA target tensors differ from the frozen base."""
+
+    adapter_path = Path(adapter_dir).resolve() / "adapter_model.safetensors"
+    if not adapter_path.is_file():
+        return {
+            "compatible": False,
+            "error": f"missing adapter weights: {adapter_path}",
+            "sampled_targets": [],
+        }
+    adapter_header = read_safetensors_header(adapter_path)
+    mapped_targets = []
+    for key in adapter_header:
+        marker = ".lora_A.weight"
+        if key == "__metadata__" or not key.endswith(marker):
+            continue
+        target = key[: -len(marker)] + ".weight"
+        if target.startswith("base_model.model."):
+            target = target[len("base_model.model.") :]
+        mapped_targets.append(target)
+
+    try:
+        base_map, base_metadata, _ = _model_weight_inventory(base_model_dir)
+        merged_map, merged_metadata, _ = _model_weight_inventory(
+            merged_model_dir
+        )
+        comparable = sorted(
+            set(mapped_targets)
+            & set(base_map)
+            & set(merged_map)
+            & set(base_metadata)
+            & set(merged_metadata),
+            key=lambda key: (
+                int(base_metadata[key]["data_offsets"][1])
+                - int(base_metadata[key]["data_offsets"][0]),
+                key,
+            ),
+        )
+        selected = comparable[:sample_count]
+        samples = []
+        for key in selected:
+            base_shape = base_metadata[key].get("shape")
+            merged_shape = merged_metadata[key].get("shape")
+            base_dtype = base_metadata[key].get("dtype")
+            merged_dtype = merged_metadata[key].get("dtype")
+            base_hash = _tensor_payload_sha256(
+                base_model_dir, base_map, base_metadata, key
+            )
+            merged_hash = _tensor_payload_sha256(
+                merged_model_dir, merged_map, merged_metadata, key
+            )
+            samples.append(
+                {
+                    "key": key,
+                    "base_shape": base_shape,
+                    "merged_shape": merged_shape,
+                    "base_dtype": base_dtype,
+                    "merged_dtype": merged_dtype,
+                    "base_payload_sha256": base_hash,
+                    "merged_payload_sha256": merged_hash,
+                    "shape_and_dtype_match": (
+                        base_shape == merged_shape
+                        and base_dtype == merged_dtype
+                    ),
+                    "payload_changed_from_base": base_hash != merged_hash,
+                }
+            )
+        compatible = bool(samples) and all(
+            sample["shape_and_dtype_match"]
+            and sample["payload_changed_from_base"]
+            for sample in samples
+        )
+        return {
+            "compatible": compatible,
+            "mapped_lora_target_count": len(set(mapped_targets)),
+            "comparable_target_count": len(comparable),
+            "requested_sample_count": sample_count,
+            "sampled_targets": samples,
+        }
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        return {
+            "compatible": False,
+            "error": f"{type(error).__name__}: {error}",
+            "sampled_targets": [],
+        }
+
+
 def inspect_adapter(adapter_dir: Path) -> dict[str, Any]:
     adapter_dir = Path(adapter_dir).resolve()
     config_path = adapter_dir / "adapter_config.json"
@@ -191,6 +459,12 @@ def inspect_adapter(adapter_dir: Path) -> dict[str, Any]:
                 "training_freeze_aligner": args.get("freeze_aligner"),
                 "training_num_epochs": args.get("num_train_epochs"),
                 "training_learning_rate": args.get("learning_rate"),
+                "training_attention_implementation": args.get(
+                    "attn_impl"
+                ),
+                "training_per_device_batch_size": args.get(
+                    "per_device_train_batch_size"
+                ),
                 "training_gradient_accumulation_steps": args.get(
                     "gradient_accumulation_steps"
                 ),
@@ -328,6 +602,7 @@ def inspect_base_model(base_model_dir: Path) -> dict[str, Any]:
                 "base_tensor_key_count": len(weight_map),
                 "base_shard_count": len(shard_names),
                 "missing_base_shards": missing_shards,
+                "base_tensor_key_sha256": _string_set_sha256(weight_map),
                 "index_sha256": sha256_file(index_path),
             }
         )
