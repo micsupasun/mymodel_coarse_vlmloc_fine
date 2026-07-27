@@ -1469,6 +1469,9 @@ def command_table8_like_vlmloc_prepare(
             else None
         ),
         require_dense_raw=cli.require_dense_raw,
+        allow_processed_missing_raw_fallback=(
+            cli.allow_processed_missing_raw_fallback
+        ),
     )
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     print(f"VLM-Loc 30 m derived-input audit: {audit_path}")
@@ -1479,6 +1482,12 @@ def command_table8_like_vlmloc_prepare(
         f"test={audit['testing']['sample_count']}"
     )
     print(f"Renderer: {audit['renderer']}")
+    fallback_count = sum(
+        scene.get("processed_fallback_object_key_count", 0)
+        for split in ("training", "validation", "testing")
+        for scene in audit[split].get("raw_scene_audits", [])
+    )
+    print(f"Audited processed fallback object keys: {fallback_count}")
     print(
         "KITTI360Pose source modified: "
         f"{audit['source_dataset_immutability']['source_dataset_modified']}; "
@@ -1921,6 +1930,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Fail instead of falling back to downsampled cell points when "
             "the raw KITTI-360 root is not supplied or incomplete."
+        ),
+    )
+    table8_like_vlmloc_prepare.add_argument(
+        "--allow-processed-missing-raw-fallback",
+        action="store_true",
+        help=(
+            "For semantic/instance keys proven absent from the current "
+            "official raw archive, use only their original processed "
+            "KITTI360Pose points and record every fallback in the audit."
         ),
     )
     table8_like_vlmloc_prepare.set_defaults(

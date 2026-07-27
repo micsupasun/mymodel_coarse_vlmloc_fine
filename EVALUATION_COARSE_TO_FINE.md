@@ -115,10 +115,19 @@ test scene required by the original KITTI360Pose split.
 
 Install the two preparation-only dependencies in the current `cmmloc_mncl`
 environment; the preparation CLI also imports the existing KITTI360Pose/
-CMMLoc code:
+CMMLoc code. Keep NumPy 1.x because the existing PyTorch/PyG binaries and
+KITTI360Pose source are not NumPy-2-compatible. `plyfile==1.1.3` supports
+NumPy >=1.21, whereas `plyfile==1.1.4` would upgrade this environment to
+NumPy >=2 and break it:
 
 ```cmd
-python -m pip install plyfile scikit-learn
+python -m pip install --force-reinstall "numpy==1.26.4" "plyfile==1.1.3"
+```
+
+Verify the complete preparation import chain before starting the long job:
+
+```cmd
+python -c "import importlib.metadata as m,numpy as np,torch,torch_geometric,plyfile,sklearn; from numpy.lib.function_base import flip; import evaluation.coarse_to_fine; print('preparation environment: PASS',np.__version__,m.version('plyfile'))"
 ```
 
 ### Step 1C: derive VLM inputs without creating a new KITTI360Pose dataset
@@ -134,10 +143,15 @@ records before/after source-tree snapshots in
 The renderer enriches the BEV representation with official dense points, uses
 the public stuff-before-object draw priority and footprint centroids, and uses
 the public PNA rule (nearest same-label node; 15 m for stuff, 5 m for objects,
-50 m for road). It fails rather than silently using downsampled points:
+50 m for road). The current official raw archive can lack a small number of
+semantic/instance keys that still exist in the published processed
+KITTI360Pose cells. The explicit compatibility flag below uses original
+processed points only for those proven-missing keys. It records every key,
+source cell and point count in the audit and uses a separate hybrid renderer
+cache; it never silently remaps an object to a different instance:
 
 ```cmd
-python -m evaluation.coarse_to_fine table8-like-vlmloc-prepare --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --manifest "evaluation_outputs\table8_like_stage1_cmmloc\cmmloc_top1_manifest.json" --raw-kitti360-root "data\KITTI-360-raw" --require-dense-raw --output-dir "evaluation_outputs\table8_like_vlmloc_data_dense_raw"
+python -m evaluation.coarse_to_fine table8-like-vlmloc-prepare --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --manifest "evaluation_outputs\table8_like_stage1_cmmloc\cmmloc_top1_manifest.json" --raw-kitti360-root "data\KITTI-360-raw" --require-dense-raw --allow-processed-missing-raw-fallback --output-dir "evaluation_outputs\table8_like_vlmloc_data_dense_raw"
 ```
 
 The testing JSON contains exactly 11,505 samples in manifest order. The
@@ -158,7 +172,7 @@ conda activate vlmloc_qwen
 ```
 
 ```cmd
-python -m pip install -U "ms-swift[llm]" pillow huggingface_hub plyfile scikit-learn
+python -m pip install -U "ms-swift[llm]" pillow huggingface_hub
 ```
 
 Download the complete Qwen3-VL-8B base at a resolved immutable revision and

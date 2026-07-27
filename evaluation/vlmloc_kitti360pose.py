@@ -50,8 +50,15 @@ RENDERER_NAME = "processed_cell_downsampled_points_v1"
 DENSE_RAW_RENDERER_NAME = (
     "official_dense_raw_points_on_origin_kitti360pose_cells_v1"
 )
+HYBRID_RAW_RENDERER_NAME = (
+    "official_dense_raw_with_audited_processed_missing_objects_v1"
+)
 SUPPORTED_RENDERERS = frozenset(
-    {RENDERER_NAME, DENSE_RAW_RENDERER_NAME}
+    {
+        RENDERER_NAME,
+        DENSE_RAW_RENDERER_NAME,
+        HYBRID_RAW_RENDERER_NAME,
+    }
 )
 SCENE_NAMES_TRAIN = (
     "2013_05_28_drive_0000_sync",
@@ -373,7 +380,11 @@ def _raw_semantic_scene_directory(
         raise FileNotFoundError(
             "Expected exactly one KITTI-360 semantic PLY directory for "
             f"{scene}; checked {[str(path) for path in candidates]}, "
-            f"found {[str(path) for path in matches]}."
+            f"found {[str(path) for path in matches]}. Download/extract and "
+            "audit the official raw files first with: python "
+            "scripts\\setup_kitti360_raw_vlmloc_gpu.py --raw-root "
+            '"data\\KITTI-360-raw" --output-dir '
+            '"evaluation_outputs\\kitti360_raw_setup"'
         )
     return matches[0]
 
@@ -388,17 +399,134 @@ def _required_raw_object_keys(
     }
 
 
+def _rgb_points_u8(rgb: np.ndarray) -> np.ndarray:
+    values = np.asarray(rgb, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise RuntimeError(f"invalid per-point RGB shape: {values.shape}")
+    if values.size and np.nanmax(values) <= 1.5:
+        values = values * 255.0
+    return np.clip(np.rint(values), 0, 255).astype(np.uint8)
+
+
+def _processed_fallback_objects(
+    cells: Sequence[Any],
+    missing_keys: set[tuple[str, int]],
+) -> tuple[
+    dict[tuple[str, int], tuple[np.ndarray, np.ndarray]],
+    list[dict[str, Any]],
+]:
+    """Recover only raw-release gaps from authoritative processed cells."""
+
+    occurrences: dict[
+        tuple[str, int],
+        list[tuple[str, np.ndarray, np.ndarray]],
+    ] = {key: [] for key in missing_keys}
+    for cell in cells:
+        bbox = np.asarray(cell.bbox_w, dtype=np.float64)
+        for obj in cell.objects:
+            key = (str(obj.label).lower(), int(obj.instance_id))
+            if key not in occurrences:
+                continue
+            normalized = np.asarray(obj.xyz, dtype=np.float64)
+            if (
+                normalized.ndim != 2
+                or normalized.shape[1] != 3
+                or not len(normalized)
+            ):
+                raise RuntimeError(
+                    f"invalid processed points for {key} in cell {cell.id}: "
+                    f"{normalized.shape}"
+                )
+            world = (
+                normalized * float(cell.cell_size) + bbox[0:3]
+            ).astype(np.float32)
+            occurrences[key].append(
+                (str(cell.id), world, _rgb_points_u8(obj.rgb))
+            )
+
+    recovered = {}
+    audit = []
+    for key in sorted(missing_keys):
+        rows = occurrences[key]
+        if not rows:
+            raise RuntimeError(
+                f"No processed KITTI360Pose points exist for missing raw "
+                f"object {key}"
+            )
+        label, instance_id = key
+        if label not in STUFF_CLASSES:
+            canonical = max(rows, key=lambda row: len(row[1]))
+            canonical_order = np.lexsort(
+                (
+                    canonical[1][:, 2],
+                    canonical[1][:, 1],
+                    canonical[1][:, 0],
+                )
+            )
+            canonical_sorted = canonical[1][canonical_order]
+            inconsistent = [
+                cell_id
+                for cell_id, xyz, _ in rows
+                if len(xyz) != len(canonical[1])
+                or np.max(
+                    np.abs(
+                        xyz[
+                            np.lexsort(
+                                (xyz[:, 2], xyz[:, 1], xyz[:, 0])
+                            )
+                        ]
+                        - canonical_sorted
+                    )
+                )
+                > 1e-3
+            ]
+            if inconsistent:
+                raise RuntimeError(
+                    "Processed non-stuff fallback occurrences are not the "
+                    f"same full object for {key}: {inconsistent[:20]}"
+                )
+            xyz, rgb = canonical[1], canonical[2]
+        else:
+            xyz = np.concatenate([row[1] for row in rows], axis=0)
+            rgb = np.concatenate([row[2] for row in rows], axis=0)
+            _, unique_indices = np.unique(
+                np.round(xyz.astype(np.float64), decimals=4),
+                axis=0,
+                return_index=True,
+            )
+            unique_indices.sort()
+            xyz = xyz[unique_indices]
+            rgb = rgb[unique_indices]
+        recovered[key] = (xyz, rgb)
+        audit.append(
+            {
+                "label": label,
+                "instance_id": instance_id,
+                "reason": "absent_from_current_official_raw_archive",
+                "source": "original_processed_kitti360pose_cell_points",
+                "occurrence_count": len(rows),
+                "source_cell_ids": [row[0] for row in rows],
+                "point_count": len(xyz),
+            }
+        )
+    return recovered, audit
+
+
 def _load_raw_scene_objects(
     raw_kitti360_root: Path,
     scene: str,
     cells: Sequence[Any],
+    *,
+    allow_processed_missing_raw_fallback: bool = False,
 ) -> tuple[dict[tuple[str, int], tuple[np.ndarray, np.ndarray]], dict[str, Any]]:
     try:
         from plyfile import PlyData
     except ImportError as error:
         raise RuntimeError(
             "Dense VLM-Loc rendering requires plyfile. Install it in the "
-            "VLM environment with: python -m pip install plyfile"
+            "CMMLoc environment without upgrading its NumPy-1.x ABI: "
+            'python -m pip install --force-reinstall "numpy==1.26.4" '
+            '"plyfile==1.1.3"'
         ) from error
 
     from datapreparation.kitti360pose.utils import CLASS_TO_LABEL
@@ -511,23 +639,38 @@ def _load_raw_scene_objects(
             }
         )
 
+    missing_key_tuples = {
+        key for key, parts in xyz_parts.items() if not parts
+    }
     missing_keys = sorted(
         f"{label}:{instance_id}"
-        for (label, instance_id), parts in xyz_parts.items()
-        if not parts
+        for label, instance_id in missing_key_tuples
     )
-    if missing_keys:
+    if missing_keys and not allow_processed_missing_raw_fallback:
         raise RuntimeError(
             f"Raw KITTI-360 files for {scene} lack required objects: "
-            f"{missing_keys[:30]}"
+            f"{missing_keys[:30]}. This is a raw-release compatibility gap, "
+            "not a missing scene. To use only the original processed "
+            "KITTI360Pose points for these explicitly audited missing keys, "
+            "rerun with --allow-processed-missing-raw-fallback."
         )
-    raw_objects = {
-        key: (
-            np.concatenate(xyz_parts[key], axis=0),
-            np.concatenate(rgb_parts[key], axis=0),
+    fallback_objects: dict[
+        tuple[str, int], tuple[np.ndarray, np.ndarray]
+    ] = {}
+    fallback_audit: list[dict[str, Any]] = []
+    if missing_key_tuples:
+        fallback_objects, fallback_audit = _processed_fallback_objects(
+            cells, missing_key_tuples
         )
-        for key in required
-    }
+    raw_objects = {}
+    for key in required:
+        if xyz_parts[key]:
+            raw_objects[key] = (
+                np.concatenate(xyz_parts[key], axis=0),
+                np.concatenate(rgb_parts[key], axis=0),
+            )
+        else:
+            raw_objects[key] = fallback_objects[key]
     inventory_signature = hashlib.sha256(
         json.dumps(
             inventory,
@@ -542,6 +685,14 @@ def _load_raw_scene_objects(
         "total_vertex_count": total_vertices,
         "selected_vertex_count": selected_vertices,
         "required_object_key_count": len(required),
+        "exact_raw_object_key_count": (
+            len(required) - len(missing_key_tuples)
+        ),
+        "processed_fallback_object_key_count": len(missing_key_tuples),
+        "processed_fallback_objects": fallback_audit,
+        "allow_processed_missing_raw_fallback": (
+            allow_processed_missing_raw_fallback
+        ),
         "inventory_metadata_sha256": inventory_signature,
         "inventory_is_content_hash": False,
         "files": inventory,
@@ -606,7 +757,8 @@ def render_dense_raw_cell(
         except ImportError as error:
             raise RuntimeError(
                 "Dense VLM-Loc rendering requires scikit-learn for the same "
-                "nearest-cluster assignment used by the public source."
+                "nearest-cluster assignment used by the public source. Keep "
+                "NumPy pinned below 2 for the existing PyTorch/PyG binaries."
             ) from error
 
         inside = np.bitwise_and.reduce(
@@ -852,18 +1004,19 @@ def _render_cell_once(
         tuple[str, int], tuple[np.ndarray, np.ndarray]
     ]
     | None = None,
+    renderer_name: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     scene_dir = image_root / str(cell.scene_name)
     scene_dir.mkdir(parents=True, exist_ok=True)
     image_path = scene_dir / f"{cell.id}.png"
     if raw_scene_objects is None:
         image, info = render_processed_cell(cell)
-        info["renderer"] = RENDERER_NAME
+        info["renderer"] = renderer_name or RENDERER_NAME
     else:
         image, info = render_dense_raw_cell(
             cell, raw_scene_objects
         )
-        info["renderer"] = DENSE_RAW_RENDERER_NAME
+        info["renderer"] = renderer_name or DENSE_RAW_RENDERER_NAME
     if overwrite or not image_path.is_file():
         Image.fromarray(image, mode="RGB").save(image_path)
     else:
@@ -883,9 +1036,14 @@ def _prepare_gt_split(
     split_name: str,
     overwrite_images: bool,
     raw_kitti360_root: Path | None,
+    allow_processed_missing_raw_fallback: bool,
 ) -> tuple[Path, dict[str, Any]]:
     renderer_name = (
-        DENSE_RAW_RENDERER_NAME
+        (
+            HYBRID_RAW_RENDERER_NAME
+            if allow_processed_missing_raw_fallback
+            else DENSE_RAW_RENDERER_NAME
+        )
         if raw_kitti360_root is not None
         else RENDERER_NAME
     )
@@ -907,6 +1065,9 @@ def _prepare_gt_split(
                     raw_kitti360_root,
                     scene,
                     dataset.all_cells,
+                    allow_processed_missing_raw_fallback=(
+                        allow_processed_missing_raw_fallback
+                    ),
                 )
             )
             raw_scene_audits.append(raw_scene_audit)
@@ -917,6 +1078,7 @@ def _prepare_gt_split(
                 image_root=image_root,
                 overwrite=overwrite_images,
                 raw_scene_objects=raw_scene_objects,
+                renderer_name=renderer_name,
             )
         cell_count += len(dataset.all_cells)
         for pose in dataset.all_poses:
@@ -966,6 +1128,7 @@ def prepare_vlmloc_data(
     overwrite_images: bool = False,
     raw_kitti360_root: Path | None = None,
     require_dense_raw: bool = False,
+    allow_processed_missing_raw_fallback: bool = False,
 ) -> Path:
     from datapreparation.kitti360pose import utils as source_utils
 
@@ -1014,6 +1177,9 @@ def prepare_vlmloc_data(
         split_name="training",
         overwrite_images=overwrite_images,
         raw_kitti360_root=raw_kitti360_root,
+        allow_processed_missing_raw_fallback=(
+            allow_processed_missing_raw_fallback
+        ),
     )
     validation_path, validation_stats = _prepare_gt_split(
         data_root,
@@ -1022,6 +1188,9 @@ def prepare_vlmloc_data(
         split_name="validation",
         overwrite_images=overwrite_images,
         raw_kitti360_root=raw_kitti360_root,
+        allow_processed_missing_raw_fallback=(
+            allow_processed_missing_raw_fallback
+        ),
     )
 
     test_dataset = load_ordered_dataset(data_root, SCENE_NAMES_TEST)
@@ -1038,7 +1207,11 @@ def prepare_vlmloc_data(
     candidate_ids = [row[0] for row in retrievals]
     unique_candidate_ids = list(dict.fromkeys(candidate_ids))
     selected_renderer_name = (
-        DENSE_RAW_RENDERER_NAME
+        (
+            HYBRID_RAW_RENDERER_NAME
+            if allow_processed_missing_raw_fallback
+            else DENSE_RAW_RENDERER_NAME
+        )
         if raw_kitti360_root is not None
         else RENDERER_NAME
     )
@@ -1066,6 +1239,9 @@ def prepare_vlmloc_data(
                     raw_kitti360_root,
                     scene,
                     [cells[cell_id] for cell_id in scene_cell_ids],
+                    allow_processed_missing_raw_fallback=(
+                        allow_processed_missing_raw_fallback
+                    ),
                 )
             )
             testing_raw_scene_audits.append(raw_scene_audit)
@@ -1075,6 +1251,7 @@ def prepare_vlmloc_data(
                 image_root=image_root,
                 overwrite=overwrite_images,
                 raw_scene_objects=raw_scene_objects,
+                renderer_name=selected_renderer_name,
             )
     missing_rendered = sorted(set(unique_candidate_ids) - set(rendered))
     if missing_rendered:
@@ -1137,8 +1314,21 @@ def prepare_vlmloc_data(
         },
         "renderer": renderer_name,
         "renderer_exactly_matches_public_dense_raw_renderer": False,
+        "allow_processed_missing_raw_fallback": (
+            allow_processed_missing_raw_fallback
+        ),
         "renderer_reason": (
             (
+                "Uses official KITTI-360 dense semantic/RGB points wherever "
+                "the current raw release contains the exact semantic/instance "
+                "key, and uses original processed KITTI360Pose object points "
+                "only for explicitly listed raw-release gaps. Every fallback "
+                "key and source cell is recorded in the split audits. This "
+                "localized compatibility layer is not claimed to be the "
+                "authors' unpublished exact renderer."
+            )
+            if renderer_name == HYBRID_RAW_RENDERER_NAME
+            else (
                 "Uses official KITTI-360 dense semantic/RGB points, public "
                 "stuff-before-object rasterization, footprint centroids, and "
                 "PNA thresholds while preserving the original ordered 30 m "
@@ -1147,7 +1337,7 @@ def prepare_vlmloc_data(
                 "closer to the paper but is not claimed to be the authors' "
                 "unreleased exact Table-8 generator."
             )
-            if raw_kitti360_root is not None
+            if renderer_name == DENSE_RAW_RENDERER_NAME
             else (
                 "The local processed KITTI360Pose cells contain normalized "
                 "downsampled xyz/rgb arrays but no xyz_raw/rgb_raw fields. "
@@ -1324,6 +1514,14 @@ def audit_vlmloc_runtime_preflight(
                 not require_dense_raw
                 or preparation.get("renderer")
                 == DENSE_RAW_RENDERER_NAME
+                or (
+                    preparation.get("renderer")
+                    == HYBRID_RAW_RENDERER_NAME
+                    and preparation.get(
+                        "allow_processed_missing_raw_fallback"
+                    )
+                    is True
+                )
             )
             and preparation.get("testing", {}).get("sample_count")
             == QUERY_COUNT
@@ -1406,6 +1604,14 @@ def audit_vlmloc_runtime_preflight(
         },
         "important_scope": (
             (
+                "This validates the separately retrained Table-8-like 30 m "
+                "adapter with official dense KITTI-360 points plus the "
+                "explicitly audited original-cell fallback only for raw "
+                "release gaps. It is not the unavailable authors' exact "
+                "Table-8 adapter or exact unpublished renderer."
+            )
+            if preparation.get("renderer") == HYBRID_RAW_RENDERER_NAME
+            else (
                 "This validates the separately retrained Table-8-like 30 m "
                 "adapter with official dense KITTI-360 points on the original "
                 "ordered KITTI360Pose cells. It is the closest audited public "

@@ -19,8 +19,10 @@ from evaluation.table8_like_protocol import (
     write_table8_like_manifest,
 )
 from evaluation.vlmloc_kitti360pose import (
+    HYBRID_RAW_RENDERER_NAME,
     _assignments,
     _assert_separate_derived_output,
+    _processed_fallback_objects,
     _query_message,
     _source_tree_metadata_snapshot,
     audit_vlmloc_merged_checkpoint,
@@ -167,6 +169,69 @@ def _dataset():
 
 
 class Table8LikePipelineTests(unittest.TestCase):
+    def test_missing_raw_compatibility_uses_only_original_cell_points(self):
+        key = ("pole", 17004)
+        object_a = SimpleNamespace(
+            label=key[0],
+            instance_id=key[1],
+            xyz=np.asarray([[0.5, 0.5, 0.25]], dtype=np.float32),
+            rgb=np.asarray([[0.5, 0.25, 0.0]], dtype=np.float32),
+        )
+        object_b = SimpleNamespace(
+            label=key[0],
+            instance_id=key[1],
+            xyz=np.asarray([[1 / 6, 1 / 6, 0.25]], dtype=np.float32),
+            rgb=np.asarray([[0.5, 0.25, 0.0]], dtype=np.float32),
+        )
+        cells = [
+            SimpleNamespace(
+                id="0000_00000",
+                bbox_w=np.asarray([0, 0, 0, 30, 30, 30]),
+                cell_size=30.0,
+                objects=[object_a],
+            ),
+            SimpleNamespace(
+                id="0000_00001",
+                bbox_w=np.asarray([10, 10, 0, 40, 40, 30]),
+                cell_size=30.0,
+                objects=[object_b],
+            ),
+        ]
+        recovered, audit = _processed_fallback_objects(cells, {key})
+        xyz, rgb = recovered[key]
+        np.testing.assert_allclose(xyz, [[15.0, 15.0, 7.5]])
+        np.testing.assert_array_equal(rgb, [[128, 64, 0]])
+        self.assertEqual(audit[0]["occurrence_count"], 2)
+        self.assertEqual(
+            audit[0]["source"],
+            "original_processed_kitti360pose_cell_points",
+        )
+        self.assertIn(
+            "audited_processed_missing_objects",
+            HYBRID_RAW_RENDERER_NAME,
+        )
+
+    def test_missing_raw_compatibility_rejects_inconsistent_instances(self):
+        key = ("pole", 17004)
+        cells = []
+        for index, x in enumerate((0.25, 0.75)):
+            obj = SimpleNamespace(
+                label=key[0],
+                instance_id=key[1],
+                xyz=np.asarray([[x, 0.5, 0.25]], dtype=np.float32),
+                rgb=np.asarray([[0.5, 0.25, 0.0]], dtype=np.float32),
+            )
+            cells.append(
+                SimpleNamespace(
+                    id=f"0000_{index:05d}",
+                    bbox_w=np.asarray([0, 0, 0, 30, 30, 30]),
+                    cell_size=30.0,
+                    objects=[obj],
+                )
+            )
+        with self.assertRaisesRegex(RuntimeError, "not the same full object"):
+            _processed_fallback_objects(cells, {key})
+
     def test_derived_output_cannot_overlap_source_dataset(self):
         root, directory = _temporary_directory()
         try:
