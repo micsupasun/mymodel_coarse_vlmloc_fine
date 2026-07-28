@@ -33,27 +33,31 @@ unchanged 30 m KITTI360Pose cells.
 
 ## GPU environment
 
-The supported user entry point is Windows Command Prompt. The `.cmd` launcher
-runs the Linux CUDA workload inside the default WSL distribution because
-Qwen3-VL-32B training uses DeepSpeed ZeRO-3 and FlashAttention. The user does
-not need to open Bash.
+The supported user entry point is native Windows Command Prompt in the
+activated `cmmloc_mncl` Conda environment. The `.cmd` launcher does not invoke
+WSL, PowerShell, Slurm, or a Linux shell.
 
-From CMD, verify that the NVIDIA GPU is visible inside WSL:
+Install ms-swift and the Python dependencies into the active Windows
+environment:
 
 ```bat
+python -m pip install -U "ms-swift[llm]" pillow huggingface_hub
+```
+
+DeepSpeed must be installed using its official native Windows build procedure,
+including the Visual C++ build tools. FlashAttention must be built or installed
+for the exact Python, PyTorch, CUDA, and GPU combination in this Conda
+environment. Do not use an unrelated wheel.
+
+Verify the complete native Windows environment before downloading or training:
+
+```bat
+conda activate cmmloc_mncl
 scripts\run_cmmloc_qwen32_gpu.cmd check
 ```
 
-Install the CMMLoc environment inside WSL first, including the repository's
-PyTorch/PyG requirements and T5-large assets. Install VLM-Loc training
-dependencies inside that WSL distribution:
-
-```bat
-wsl python -m pip install -U "ms-swift[llm]" deepspeed flash-attn pillow huggingface_hub
-```
-
-Alternatively, enter WSL once to create or activate the intended environment.
-All experiment stages themselves are launched from CMD.
+The check fails closed unless Windows can load NVIDIA, PyTorch CUDA/BF16,
+ms-swift, DeepSpeed, and FlashAttention.
 
 Qwen3-VL-32B BF16 is large. In CMD, select the GPUs:
 
@@ -61,15 +65,9 @@ Qwen3-VL-32B BF16 is large. In CMD, select the GPUs:
 set GPU_LIST=0,1,2,3
 ```
 
-One, two, or four training processes are accepted. The launcher adjusts
-gradient accumulation to preserve the paper's global batch size of 4.
-
-The underlying Linux dependency command is:
-
-```text
-python -m pip install -U "ms-swift[llm]" deepspeed flash-attn \
-  pillow huggingface_hub
-```
+One, two, or four training processes are accepted. The launcher sets
+`NPROC_PER_NODE` and adjusts gradient accumulation to preserve the paper's
+global batch size of 4.
 
 ## Run order
 
