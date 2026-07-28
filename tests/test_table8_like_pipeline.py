@@ -24,6 +24,7 @@ from evaluation.vlmloc_kitti360pose import (
     _assert_separate_derived_output,
     _crop_raw_points_to_bbox,
     _group_selected_indices_by_packed_key,
+    _ordered_referenced_cells,
     _pack_semantic_instance,
     _processed_fallback_objects,
     _query_message,
@@ -173,6 +174,46 @@ def _dataset():
 
 
 class Table8LikePipelineTests(unittest.TestCase):
+    def test_referenced_cells_preserve_source_order_and_skip_no_sample(self):
+        cells = [
+            SimpleNamespace(id="cell_a"),
+            SimpleNamespace(id="cell_b"),
+            SimpleNamespace(id="cell_c"),
+        ]
+        poses = [
+            SimpleNamespace(cell_id="cell_c"),
+            SimpleNamespace(cell_id="cell_a"),
+            SimpleNamespace(cell_id="cell_c"),
+        ]
+        selected, audit = _ordered_referenced_cells(
+            SimpleNamespace(all_cells=cells, all_poses=poses)
+        )
+        self.assertEqual(
+            [cell.id for cell in selected],
+            ["cell_a", "cell_c"],
+        )
+        self.assertEqual(
+            [pose.cell_id for pose in poses],
+            ["cell_c", "cell_a", "cell_c"],
+        )
+        self.assertEqual(
+            audit,
+            {
+                "source_cell_count": 3,
+                "referenced_cell_count": 2,
+                "unused_source_cell_count": 1,
+            },
+        )
+
+    def test_referenced_cells_reject_unknown_pose_cell(self):
+        with self.assertRaisesRegex(RuntimeError, "unknown source cells"):
+            _ordered_referenced_cells(
+                SimpleNamespace(
+                    all_cells=[SimpleNamespace(id="cell_a")],
+                    all_poses=[SimpleNamespace(cell_id="cell_missing")],
+                )
+            )
+
     def test_grouped_raw_rows_match_pairwise_reference(self):
         packed = np.asarray([30, 10, 30, 20, 10, 40], dtype=np.int64)
         selected = np.asarray([0, 1, 2, 4, 5], dtype=np.int64)

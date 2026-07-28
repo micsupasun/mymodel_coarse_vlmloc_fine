@@ -155,6 +155,12 @@ processed cluster and records the cell-level reason. Each completed image has
 a `.render.json` sidecar so a restarted preparation can resume without
 recomputing completed cells:
 
+Only cells referenced by an actual train/validation pose are rendered. This
+does not filter or reorder samples: all 28,807 training poses and 3,187
+validation poses remain in source order. It avoids creating unused images
+(4,594 of 11,259 train cells and 524 of 1,434 validation cells are actually
+referenced), and records source/rendered/skipped counts in the audit.
+
 ```cmd
 python -m evaluation.coarse_to_fine table8-like-vlmloc-prepare --data-root "data\k360_30-10_scG_pd10_pc4_spY_all" --checkpoint-root "checkpoints\k360_30-10_scG_pd10_pc4_spY_all" --manifest "evaluation_outputs\table8_like_stage1_cmmloc\cmmloc_top1_manifest.json" --raw-kitti360-root "data\KITTI-360-raw" --require-dense-raw --allow-processed-missing-raw-fallback --output-dir "evaluation_outputs\table8_like_vlmloc_data_dense_raw"
 ```

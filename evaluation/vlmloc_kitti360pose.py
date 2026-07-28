@@ -223,6 +223,35 @@ def load_ordered_dataset(
     return OrderedDataset(list(scene_names), poses, cells)
 
 
+def _ordered_referenced_cells(
+    dataset: OrderedDataset,
+) -> tuple[list[Any], dict[str, int]]:
+    """Keep source cell order, excluding cells absent from all pose samples."""
+
+    referenced_ids = {
+        str(pose.cell_id) for pose in dataset.all_poses
+    }
+    all_ids = {str(cell.id) for cell in dataset.all_cells}
+    missing_ids = sorted(referenced_ids - all_ids)
+    if missing_ids:
+        raise RuntimeError(
+            "poses reference unknown source cells: "
+            f"{missing_ids[:30]}"
+        )
+    referenced_cells = [
+        cell
+        for cell in dataset.all_cells
+        if str(cell.id) in referenced_ids
+    ]
+    return referenced_cells, {
+        "source_cell_count": len(dataset.all_cells),
+        "referenced_cell_count": len(referenced_cells),
+        "unused_source_cell_count": (
+            len(dataset.all_cells) - len(referenced_cells)
+        ),
+    }
+
+
 def normalized_xy_to_pixel(
     xy: np.ndarray | Sequence[float],
     *,
@@ -1230,6 +1259,8 @@ def _prepare_gt_split(
     samples = []
     outside_count = 0
     cell_count = 0
+    source_cell_count = 0
+    unused_source_cell_count = 0
     sample_index = 0
     raw_scene_audits = []
     processed_cell_fallbacks: list[dict[str, Any]] = []
@@ -1242,13 +1273,27 @@ def _prepare_gt_split(
         )
         dataset = load_ordered_dataset(data_root, [scene])
         cells = {str(cell.id): cell for cell in dataset.all_cells}
+        referenced_cells, referenced_audit = _ordered_referenced_cells(
+            dataset
+        )
+        source_cell_count += referenced_audit["source_cell_count"]
+        unused_source_cell_count += referenced_audit[
+            "unused_source_cell_count"
+        ]
+        print(
+            f"Referenced-cell audit: scene={scene}, source_cells="
+            f"{referenced_audit['source_cell_count']}, rendered_cells="
+            f"{referenced_audit['referenced_cell_count']}, skipped_unused="
+            f"{referenced_audit['unused_source_cell_count']}",
+            flush=True,
+        )
         raw_scene_objects = None
         if raw_kitti360_root is not None:
             raw_scene_objects, raw_scene_audit = (
                 _load_raw_scene_objects(
                     raw_kitti360_root,
                     scene,
-                    dataset.all_cells,
+                    referenced_cells,
                     allow_processed_missing_raw_fallback=(
                         allow_processed_missing_raw_fallback
                     ),
@@ -1264,7 +1309,7 @@ def _prepare_gt_split(
             )
         rendered: dict[str, tuple[Path, dict[str, Any]]] = {}
         render_started = time.perf_counter()
-        for cell_index, cell in enumerate(dataset.all_cells, start=1):
+        for cell_index, cell in enumerate(referenced_cells, start=1):
             render_result = _render_cell_once(
                 cell,
                 image_root=image_root,
@@ -1289,15 +1334,15 @@ def _prepare_gt_split(
             if (
                 cell_index == 1
                 or cell_index % 100 == 0
-                or cell_index == len(dataset.all_cells)
+                or cell_index == len(referenced_cells)
             ):
                 print(
                     f"Rendered {split_name} {scene}: "
-                    f"{cell_index}/{len(dataset.all_cells)} cells, "
+                    f"{cell_index}/{len(referenced_cells)} cells, "
                     f"seconds={time.perf_counter() - render_started:.1f}",
                     flush=True,
                 )
-        cell_count += len(dataset.all_cells)
+        cell_count += len(referenced_cells)
         for pose in dataset.all_poses:
             cell = cells.get(str(pose.cell_id))
             if cell is None:
@@ -1330,6 +1375,8 @@ def _prepare_gt_split(
         "scenes": list(scenes),
         "sample_count": len(samples),
         "cell_count": cell_count,
+        "source_cell_count": source_cell_count,
+        "unused_source_cell_count": unused_source_cell_count,
         "dataset_json_path": str(json_path.resolve()),
         "dataset_json_sha256": _sha256_file(json_path),
         "raw_scene_audits": raw_scene_audits,
