@@ -33,7 +33,6 @@ if not defined FINAL_ADAPTER set "FINAL_ADAPTER=%VLMLOC_ROOT%\table8_kitti360pos
 if not defined GPU_LIST set "GPU_LIST=0,1,2,3"
 if not defined COARSE_BATCH_SIZE set "COARSE_BATCH_SIZE=16"
 if not defined COARSE_DEVICE set "COARSE_DEVICE=cuda:0"
-if not defined PYTORCH_CUDA_ALLOC_CONF set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 set "GLOBAL_BATCH_SIZE=4"
 
 set "GPU_COUNT=0"
@@ -94,7 +93,7 @@ if errorlevel 1 (
   popd
   exit /b 2
 )
-python -c "import torch; print('torch=', torch.__version__); print('torch_cuda=', torch.version.cuda); print('cuda_available=', torch.cuda.is_available()); print('gpu_count=', torch.cuda.device_count()); print('bf16_supported=', torch.cuda.is_bf16_supported()); assert torch.cuda.is_available(), 'PyTorch CUDA is unavailable'; assert torch.cuda.is_bf16_supported(), 'BF16 is unsupported by this GPU/PyTorch build'"
+python -c "import torch; from packaging.version import Version; print('torch=', torch.__version__); print('torch_cuda=', torch.version.cuda); print('cuda_available=', torch.cuda.is_available()); print('gpu_count=', torch.cuda.device_count()); assert Version(torch.__version__.split('+')[0]) >= Version('2.1.0'), 'PyTorch >= 2.1 is required'; print('bf16_supported=', torch.cuda.is_bf16_supported()); assert torch.cuda.is_available(), 'PyTorch CUDA is unavailable'; assert torch.cuda.is_bf16_supported(), 'BF16 is unsupported by this GPU/PyTorch build'"
 if errorlevel 1 (
   echo ERROR: PyTorch CUDA/BF16 preflight failed.
   popd
@@ -194,6 +193,7 @@ if errorlevel 1 goto command_failed
 
 set "CUDA_VISIBLE_DEVICES=%GPU_LIST%"
 set "NPROC_PER_NODE=%TRAIN_WORLD_SIZE%"
+if not defined PYTORCH_CUDA_ALLOC_CONF set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 echo Training world size: %TRAIN_WORLD_SIZE%
 echo Per-device batch: 1
 echo Gradient accumulation: %GRAD_ACCUMULATION%
@@ -274,6 +274,7 @@ if exist "%PREFLIGHT_DIR%\adapter_smoke_predictions.jsonl" (
   exit /b 2
 )
 set "CUDA_VISIBLE_DEVICES=%GPU_LIST%"
+if not defined PYTORCH_CUDA_ALLOC_CONF set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 swift infer ^
   --model "%QWEN_BASE%" ^
   --adapters "%FINAL_ADAPTER%" ^
@@ -324,6 +325,7 @@ if exist "%INFERENCE_DIR%\predictions.jsonl" (
   exit /b 2
 )
 set "CUDA_VISIBLE_DEVICES=%GPU_LIST%"
+if not defined PYTORCH_CUDA_ALLOC_CONF set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 swift infer ^
   --model "%QWEN_BASE%" ^
   --adapters "%FINAL_ADAPTER%" ^
