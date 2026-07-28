@@ -1544,7 +1544,7 @@ def command_table8_like_vlmloc_preflight(
             checkpoint_root
             / "VLM-Loc"
             / "base_models"
-            / "Qwen3-VL-8B-Instruct"
+            / "Qwen3-VL-32B-Instruct"
         ),
         official_source_dir=(
             checkpoint_root
@@ -1576,7 +1576,7 @@ def command_table8_like_vlmloc_merged_preflight(
             checkpoint_root
             / "VLM-Loc"
             / "base_models"
-            / "Qwen3-VL-8B-Instruct"
+            / "Qwen3-VL-32B-Instruct"
         ),
         merged_model_dir=Path(cli.merged_model_dir),
         adapter_smoke_predictions_path=Path(

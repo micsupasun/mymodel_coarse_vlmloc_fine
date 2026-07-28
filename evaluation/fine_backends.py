@@ -17,7 +17,7 @@ from evaluation.vlmloc_release import (
     OFFICIAL_HF_DATASET,
     OFFICIAL_SOURCE_COMMIT,
     PUBLIC_RELEASE_FILES,
-    QWEN3_VL_8B_MODEL_ID,
+    QWEN3_VL_32B_MODEL_ID,
     default_vlmloc_paths,
     inspect_adapter,
     inspect_base_model,
@@ -275,7 +275,7 @@ def preflight_vlmloc(
     )
     adapter_records = _adapter_records(vlmloc_root)
     paths = default_vlmloc_paths(vlmloc_root)
-    public_qwen8_adapter = inspect_adapter(paths["public_adapter"])
+    public_qwen32_adapter = inspect_adapter(paths["public_adapter"])
     table8_adapter = inspect_adapter(paths["table8_adapter"])
     base_model = inspect_base_model(paths["base_model"])
     official_source = inspect_official_source(paths["official_source"])
@@ -309,9 +309,9 @@ def preflight_vlmloc(
         if table8_adapter.get(key) != expected
     }
     public_adapter_is_cityloc = bool(
-        public_qwen8_adapter.get("adapter_weights_exists")
+        public_qwen32_adapter.get("adapter_weights_exists")
         and (
-            public_qwen8_adapter.get("training_dataset_tokens")
+            public_qwen32_adapter.get("training_dataset_tokens")
             or len(testing_data) != current_dataset_signature["query_count"]
         )
     )
@@ -325,7 +325,7 @@ def preflight_vlmloc(
         and provenance.get("compatible")
         and artifact_hash_audit.get("compatible")
         and not adapter_semantic_mismatches
-        and base_model.get("architecture_matches_qwen3_vl_8b")
+        and base_model.get("architecture_matches_qwen3_vl")
         and not base_model.get("missing_base_shards", ["not-audited"])
         and official_source.get("source_commit_matches")
         and not official_source.get("missing_required_source_files")
@@ -333,7 +333,7 @@ def preflight_vlmloc(
     missing_keys = []
     if not exact_adapter_files_exist:
         missing_keys.append(
-            "Exact KITTI360Pose 30 m Qwen3-VL-8B adapter_config.json, "
+            "Exact KITTI360Pose 30 m Qwen3-VL-32B adapter_config.json, "
             "adapter_model.safetensors, and args.json are absent from "
             f"{paths['table8_adapter']}."
         )
@@ -354,9 +354,9 @@ def preflight_vlmloc(
             f"not match the required VLM-Loc configuration: "
             f"{adapter_semantic_mismatches}."
         )
-    if not base_model.get("architecture_matches_qwen3_vl_8b"):
+    if not base_model.get("architecture_matches_qwen3_vl"):
         missing_keys.append(
-            f"The complete {QWEN3_VL_8B_MODEL_ID} base model is absent or its "
+            f"The complete {QWEN3_VL_32B_MODEL_ID} base model is absent or its "
             "config architecture does not match Qwen3VLForConditionalGeneration."
         )
     if not official_source.get("source_commit_matches"):
@@ -374,7 +374,8 @@ def preflight_vlmloc(
     unexpected_keys = []
     if public_adapter_is_cityloc:
         unexpected_keys.append(
-            "The public checkpoint-3600 adapter records CityLoc-K/50 m training "
+            "The public Qwen3-VL-32B checkpoint-3300 adapter records "
+            "CityLoc-K/50 m training "
             "paths and is quarantined as a reference artifact, not selected as "
             "the KITTI360Pose 30 m fine backend."
         )
@@ -399,10 +400,10 @@ def preflight_vlmloc(
         "expected_dataset_token": EXPECTED_DATASET_TOKEN,
         "adapters": adapter_records,
         "adapter_count": len(adapter_records),
-        "selected_base_model_id": QWEN3_VL_8B_MODEL_ID,
+        "selected_base_model_id": QWEN3_VL_32B_MODEL_ID,
         "public_release_repository": OFFICIAL_HF_DATASET,
         "public_release_files": PUBLIC_RELEASE_FILES,
-        "public_qwen8_cityloc_adapter_audit": public_qwen8_adapter,
+        "public_qwen32_cityloc_adapter_audit": public_qwen32_adapter,
         "table8_adapter_audit": table8_adapter,
         "table8_provenance_audit": provenance,
         "table8_artifact_hash_audit": artifact_hash_audit,
@@ -417,7 +418,7 @@ def preflight_vlmloc(
         ),
         "shape_comparison_to_base_attempted": bool(
             exact_adapter_files_exist
-            and base_model.get("architecture_matches_qwen3_vl_8b")
+            and base_model.get("architecture_matches_qwen3_vl")
         ),
         "compatible": False,
         "load_attempted": False,
@@ -428,7 +429,7 @@ def preflight_vlmloc(
             "internal_shape_mismatches", []
         ),
         "public_reference_internal_shape_mismatches": (
-            public_qwen8_adapter.get("internal_shape_mismatches", [])
+            public_qwen32_adapter.get("internal_shape_mismatches", [])
         ),
         "reason": (
             "The downloadable files are PEFT/LoRA CAUSAL_LM adapters and "

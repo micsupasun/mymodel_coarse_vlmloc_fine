@@ -34,13 +34,16 @@ from evaluation.table8_like_protocol import (
     load_table8_like_manifest,
 )
 from evaluation.vlmloc_release import (
-    QWEN3_VL_8B_ARCHITECTURE,
+    QWEN3_VL_ARCHITECTURE,
+    TABLE8_PROVENANCE_NAME,
     audit_merged_lora_application,
     inspect_adapter,
     inspect_base_model,
     inspect_full_model,
     inspect_official_source,
     inspect_python_environment,
+    validate_table8_artifact_hashes,
+    validate_table8_provenance,
 )
 
 
@@ -1721,6 +1724,28 @@ def audit_vlmloc_runtime_preflight(
     base_model = inspect_base_model(base_model_dir)
     source = inspect_official_source(official_source_dir)
     environment = inspect_python_environment()
+    ordered_signature = preparation.get("testing", {}).get(
+        "ordered_dataset_signature", {}
+    )
+    provenance_path = adapter_dir / TABLE8_PROVENANCE_NAME
+    provenance = validate_table8_provenance(
+        provenance_path,
+        current_query_count=preparation.get("testing", {}).get(
+            "sample_count", -1
+        ),
+        current_query_order_sha256=ordered_signature.get(
+            "ordered_query_sha256"
+        ),
+        current_cell_order_sha256=ordered_signature.get(
+            "ordered_cell_sha256"
+        ),
+    )
+    artifact_hash_audit = validate_table8_artifact_hashes(
+        provenance,
+        adapter_audit=adapter,
+        base_model_audit=base_model,
+        official_source_audit=source,
+    )
     smoke_rows = (
         _load_jsonl(smoke_predictions_path)
         if smoke_predictions_path.is_file()
@@ -1782,7 +1807,6 @@ def audit_vlmloc_runtime_preflight(
         "training_learning_rate": 1e-4,
         "training_attention_implementation": "flash_attn",
         "training_per_device_batch_size": 1,
-        "training_gradient_accumulation_steps": 4,
         "training_seed": 42,
         "data_seed": 42,
     }
@@ -1818,27 +1842,46 @@ def audit_vlmloc_runtime_preflight(
             "expected": expected_validation,
             "actual": sorted(validation_paths),
         }
+    provenance_record = provenance.get("record") or {}
+    accumulation = adapter.get("training_gradient_accumulation_steps")
+    if (
+        not isinstance(accumulation, int)
+        or accumulation < 1
+        or provenance_record.get("gradient_accumulation_steps")
+        != accumulation
+        or provenance_record.get("effective_global_batch_size") != 4
+    ):
+        adapter_mismatches["effective_global_batch_size"] = {
+            "expected": 4,
+            "adapter_gradient_accumulation_steps": accumulation,
+            "provenance_gradient_accumulation_steps": (
+                provenance_record.get("gradient_accumulation_steps")
+            ),
+            "provenance_effective_global_batch_size": (
+                provenance_record.get("effective_global_batch_size")
+            ),
+        }
 
     checks = {
         "prepared_data_complete_and_hashes_match": bool(
             preparation
-            and preparation.get("renderer") in SUPPORTED_RENDERERS
-            and (
-                not require_dense_raw
-                or preparation.get("renderer")
-                == DENSE_RAW_RENDERER_NAME
-                or (
-                    preparation.get("renderer")
-                    == HYBRID_RAW_RENDERER_NAME
-                    and preparation.get(
-                        "allow_processed_missing_raw_fallback"
-                    )
-                    is True
-                )
+            and preparation.get("renderer") == RENDERER_NAME
+            and preparation.get("uses_dense_raw_kitti360_points") is False
+            and preparation.get("source_dataset_immutability", {}).get(
+                "source_dataset_modified"
             )
+            is False
             and preparation.get("testing", {}).get("sample_count")
             == QUERY_COUNT
             and data_hashes_match
+        ),
+        "finalization_provenance_and_hashes": bool(
+            provenance.get("compatible")
+            and artifact_hash_audit.get("compatible")
+            and provenance_record.get(
+                "uses_original_processed_kitti360pose_cells_only"
+            )
+            is True
         ),
         "adapter_metadata_and_internal_lora_shapes": bool(
             adapter.get("adapter_config_exists")
@@ -1849,7 +1892,7 @@ def audit_vlmloc_runtime_preflight(
             and not adapter_mismatches
         ),
         "base_model_complete": bool(
-            base_model.get("architecture_matches_qwen3_vl_8b")
+            base_model.get("architecture_matches_qwen3_vl")
             and not base_model.get("missing_base_shards", ["not-audited"])
             and isinstance(base_model.get("resolved_model_revision"), str)
             and bool(
@@ -1876,8 +1919,10 @@ def audit_vlmloc_runtime_preflight(
         "comparison_scope": "table8_like_full_test_11505",
         "adapter_audit": adapter,
         "adapter_mismatches": adapter_mismatches,
+        "finalization_provenance_audit": provenance,
+        "finalization_artifact_hash_audit": artifact_hash_audit,
         "base_model_audit": base_model,
-        "expected_base_architecture": QWEN3_VL_8B_ARCHITECTURE,
+        "expected_base_architecture": QWEN3_VL_ARCHITECTURE,
         "official_source_audit": source,
         "python_environment_audit": environment,
         "preparation_audit_path": str(preparation_path),
@@ -1932,9 +1977,10 @@ def audit_vlmloc_runtime_preflight(
             )
             if preparation.get("renderer") == DENSE_RAW_RENDERER_NAME
             else (
-                "This validates the separately retrained Table-8-like 30 m "
-                "adapter with the downsampled-point fallback, not the closest "
-                "dense-raw path or unavailable exact Table-8 adapter."
+                "This validates the requested immutable-dataset experiment: "
+                "the separately retrained 30 m adapter uses only the original "
+                "processed KITTI360Pose cell points. It is Table-8-like and "
+                "is not labeled as the authors' unavailable exact adapter."
             )
         ),
     }
@@ -2061,7 +2107,7 @@ def audit_vlmloc_merged_checkpoint(
         == merged.get("header_tensor_key_count")
     )
     merged_inventory_complete = bool(
-        merged.get("architecture_matches_qwen3_vl_8b")
+        merged.get("architecture_matches_qwen3_vl")
         and int(merged.get("header_tensor_key_count") or 0) > 0
         and not merged.get("missing_required_inference_files", ["missing"])
         and not merged.get("missing_shards", ["missing"])
@@ -2081,8 +2127,8 @@ def audit_vlmloc_merged_checkpoint(
             and not adapter.get("unpaired_lora_keys", ["missing"])
             and not adapter.get("internal_shape_mismatches", ["missing"])
         ),
-        "base_model_complete_and_qwen3_vl_8b": bool(
-            base.get("architecture_matches_qwen3_vl_8b")
+        "base_model_complete_and_qwen3_vl_32b": bool(
+            base.get("architecture_matches_qwen3_vl")
             and base.get("safetensors_index_exists")
             and not base.get("missing_base_shards", ["missing"])
             and base.get("revision_marker_exists")

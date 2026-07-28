@@ -1,4 +1,4 @@
-"""Download and audit the public Qwen3-VL-8B/VLM-Loc assets on the GPU PC.
+"""Download and audit the Qwen3-VL-32B/VLM-Loc assets on the GPU PC.
 
 This intentionally does not download CityLoc-C/CityLoc-K by default: those
 archives use the public 50 m CityLoc protocol and cannot stand in for the
@@ -27,9 +27,9 @@ from evaluation.vlmloc_release import (
     OFFICIAL_HF_DATASET,
     OFFICIAL_SOURCE_COMMIT,
     OFFICIAL_SOURCE_REPOSITORY,
-    PUBLIC_QWEN8_ADAPTER_RELATIVE,
+    PUBLIC_QWEN32_ADAPTER_RELATIVE,
     PUBLIC_RELEASE_FILES,
-    QWEN3_VL_8B_MODEL_ID,
+    QWEN3_VL_32B_MODEL_ID,
     default_vlmloc_paths,
     inspect_adapter,
     inspect_base_model,
@@ -38,7 +38,7 @@ from evaluation.vlmloc_release import (
 )
 
 
-MIN_FREE_BYTES_FOR_BASE_MODEL = 20 * 1024**3
+MIN_FREE_BYTES_FOR_BASE_MODEL = 75 * 1024**3
 
 
 def _disk_free(path: Path) -> int:
@@ -72,23 +72,23 @@ def _safe_extract_tar(archive: Path, destination: Path) -> None:
         bundle.extractall(destination)
 
 
-def _find_public_qwen8_adapter(root: Path) -> Path | None:
-    exact = root / PUBLIC_QWEN8_ADAPTER_RELATIVE
+def _find_public_qwen32_adapter(root: Path) -> Path | None:
+    exact = root / PUBLIC_QWEN32_ADAPTER_RELATIVE
     if (exact / "adapter_config.json").is_file():
         return exact
     matches = sorted(
         path.parent
         for path in root.glob("**/adapter_config.json")
-        if "qwen3_8b" in str(path).lower()
-        and path.parent.name == "checkpoint-3600"
+        if "qwen3_32b" in str(path).lower()
+        and path.parent.name == "checkpoint-3300"
     )
     return matches[0] if matches else None
 
 
 def _download_public_adapter(vlmloc_root: Path) -> Path:
-    existing = _find_public_qwen8_adapter(vlmloc_root)
+    existing = _find_public_qwen32_adapter(vlmloc_root)
     if existing is not None:
-        print(f"Public CityLoc Qwen3-VL-8B adapter already exists: {existing}")
+        print(f"Public CityLoc Qwen3-VL-32B adapter already exists: {existing}")
         return existing
 
     try:
@@ -114,12 +114,12 @@ def _download_public_adapter(vlmloc_root: Path) -> Path:
     extract_dir = vlmloc_root / "_public_checkpoint_extract"
     extract_dir.mkdir(parents=True, exist_ok=True)
     _safe_extract_tar(archive, extract_dir)
-    found = _find_public_qwen8_adapter(extract_dir)
+    found = _find_public_qwen32_adapter(extract_dir)
     if found is None:
         raise RuntimeError(
-            f"Qwen3-VL-8B checkpoint-3600 not found after extracting {archive}"
+            f"Qwen3-VL-32B checkpoint-3300 not found after extracting {archive}"
         )
-    target = vlmloc_root / PUBLIC_QWEN8_ADAPTER_RELATIVE
+    target = vlmloc_root / PUBLIC_QWEN32_ADAPTER_RELATIVE
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise RuntimeError(f"Refusing to overwrite existing adapter directory: {target}")
@@ -133,7 +133,7 @@ def _download_base_model(vlmloc_root: Path) -> Path:
     if (target / "config.json").is_file() and (
         target / "model.safetensors.index.json"
     ).is_file() and revision_marker.is_file():
-        print(f"Qwen3-VL-8B base model already exists: {target}")
+        print(f"Qwen3-VL-32B base model already exists: {target}")
         return target
     if target.exists() and any(target.iterdir()):
         raise RuntimeError(
@@ -141,7 +141,9 @@ def _download_base_model(vlmloc_root: Path) -> Path:
             f"directory without an immutable revision marker: {target}. "
             "Move it aside and rerun, or audit it manually."
         )
-    _require_free_space(target, MIN_FREE_BYTES_FOR_BASE_MODEL, QWEN3_VL_8B_MODEL_ID)
+    _require_free_space(
+        target, MIN_FREE_BYTES_FOR_BASE_MODEL, QWEN3_VL_32B_MODEL_ID
+    )
     try:
         from huggingface_hub import HfApi, snapshot_download
     except ImportError as error:
@@ -150,15 +152,15 @@ def _download_base_model(vlmloc_root: Path) -> Path:
             "with: python -m pip install huggingface_hub"
         ) from error
 
-    resolved_revision = HfApi().model_info(QWEN3_VL_8B_MODEL_ID).sha
+    resolved_revision = HfApi().model_info(QWEN3_VL_32B_MODEL_ID).sha
     if not resolved_revision:
         raise RuntimeError(
             f"Could not resolve an immutable revision for "
-            f"{QWEN3_VL_8B_MODEL_ID}."
+            f"{QWEN3_VL_32B_MODEL_ID}."
         )
     target.mkdir(parents=True, exist_ok=True)
     snapshot_download(
-        repo_id=QWEN3_VL_8B_MODEL_ID,
+        repo_id=QWEN3_VL_32B_MODEL_ID,
         revision=resolved_revision,
         local_dir=str(target),
         allow_patterns=[
@@ -216,16 +218,16 @@ def _download_official_source(vlmloc_root: Path) -> Path:
 
 def _audit(vlmloc_root: Path) -> dict[str, Any]:
     paths = default_vlmloc_paths(vlmloc_root)
-    public_adapter = _find_public_qwen8_adapter(vlmloc_root)
+    public_adapter = _find_public_qwen32_adapter(vlmloc_root)
     report: dict[str, Any] = {
         "schema_version": 1,
         "vlmloc_root": str(vlmloc_root.resolve()),
         "official_hf_dataset": OFFICIAL_HF_DATASET,
         "official_source_repository": OFFICIAL_SOURCE_REPOSITORY,
         "official_source_commit": OFFICIAL_SOURCE_COMMIT,
-        "base_model_id": QWEN3_VL_8B_MODEL_ID,
+        "base_model_id": QWEN3_VL_32B_MODEL_ID,
         "public_release_files": PUBLIC_RELEASE_FILES,
-        "public_qwen8_adapter": (
+        "public_qwen32_adapter": (
             inspect_adapter(public_adapter) if public_adapter else None
         ),
         "base_model": inspect_base_model(paths["base_model"]),
@@ -238,20 +240,21 @@ def _audit(vlmloc_root: Path) -> dict[str, Any]:
         ).is_file(),
         "table8_provenance_present": paths["table8_provenance"].is_file(),
         "important_distinction": (
-            "The downloadable checkpoint-3600 is the public CityLoc-K 50 m "
-            "adapter. It is not the separately retrained 30 m KITTI360Pose "
+            "The downloadable Qwen3-VL-32B checkpoint-3300 is the public "
+            "CityLoc-K 50 m adapter. It is not the separately retrained "
+            "30 m KITTI360Pose "
             "Table-8 adapter."
         ),
     }
     report["public_assets_ready"] = bool(
-        report["public_qwen8_adapter"]
-        and report["base_model"].get("architecture_matches_qwen3_vl_8b")
+        report["public_qwen32_adapter"]
+        and report["base_model"].get("architecture_matches_qwen3_vl")
         and not report["base_model"].get("missing_base_shards", ["unknown"])
         and report["official_source"].get("source_commit_matches")
         and not report["official_source"].get("missing_required_source_files")
     )
     report["table8_like_retraining_assets_ready"] = bool(
-        report["base_model"].get("architecture_matches_qwen3_vl_8b")
+        report["base_model"].get("architecture_matches_qwen3_vl")
         and not report["base_model"].get(
             "missing_base_shards", ["unknown"]
         )
@@ -272,7 +275,7 @@ def _audit(vlmloc_root: Path) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Download/audit the public VLM-Loc Qwen3-VL-8B assets on the GPU "
+            "Download/audit the VLM-Loc Qwen3-VL-32B assets on the GPU "
             "machine without confusing CityLoc-K with KITTI360Pose Table 8."
         )
     )

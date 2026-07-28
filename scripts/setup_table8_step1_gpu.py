@@ -170,6 +170,14 @@ def _audit(
         )
     )
     table8_provenance_present = vlmloc_paths["table8_provenance"].is_file()
+    coarse_stage_ready = bool(
+        cmmloc_checkpoint.get("compatible_with_public_source")
+        and cmmloc_source.get("compatible")
+    )
+    fine_source_ready = bool(
+        vlmloc_source.get("source_commit_matches")
+        and not vlmloc_source.get("missing_required_source_files")
+    )
     return {
         "schema_version": 1,
         "experiment": "CMMLoc coarse Top-1 + VLM-Loc fine",
@@ -192,11 +200,11 @@ def _audit(
             and cmmloc_source.get("source_files_match_pinned_commit")
             and vlmloc_source.get("source_commit_matches")
         ),
-        "table8_step1_assets_ready": bool(
-            cmmloc_checkpoint.get("compatible_with_public_source")
-            and cmmloc_source.get("compatible")
-            and table8_adapter_present
-            and table8_provenance_present
+        "cmmloc_top1_stage_ready": coarse_stage_ready,
+        "vlmloc_retraining_source_ready": fine_source_ready,
+        "table8_step1_assets_ready": coarse_stage_ready and fine_source_ready,
+        "trained_qwen32_fine_checkpoint_ready": bool(
+            table8_adapter_present and table8_provenance_present
         ),
         "important_distinction": (
             "The public VLM-Loc checkpoint is trained for CityLoc-K/50 m. It "
@@ -262,6 +270,14 @@ def main() -> int:
         "available_public_assets_downloaded="
         f"{report['available_public_assets_downloaded']}"
     )
+    print(
+        "cmmloc_top1_stage_ready="
+        f"{report['cmmloc_top1_stage_ready']}"
+    )
+    print(
+        "vlmloc_retraining_source_ready="
+        f"{report['vlmloc_retraining_source_ready']}"
+    )
     print(f"table8_step1_assets_ready={report['table8_step1_assets_ready']}")
     if setup_errors:
         for error in setup_errors:
@@ -269,8 +285,8 @@ def main() -> int:
         return 1
     if not report["table8_step1_assets_ready"]:
         print(
-            "All obtainable official assets were audited, but exact Table-8 "
-            "inference remains blocked; inspect the report.",
+            "The public CMMLoc/VLM-Loc source assets required to begin this "
+            "experiment are incomplete; inspect the report.",
             file=sys.stderr,
         )
         return 2

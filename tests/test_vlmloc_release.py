@@ -12,7 +12,7 @@ from evaluation.vlmloc_release import (
     EXPECTED_DATASET_TOKEN,
     EXPECTED_TEST_SCENES,
     OFFICIAL_SOURCE_COMMIT,
-    QWEN3_VL_8B_MODEL_ID,
+    QWEN3_VL_32B_MODEL_ID,
     TABLE8_PROVENANCE_NAME,
     dataset_tokens,
     default_vlmloc_paths,
@@ -22,6 +22,7 @@ from evaluation.vlmloc_release import (
     validate_table8_artifact_hashes,
     validate_table8_provenance,
 )
+from scripts.finalize_qwen32_adapter import _validate_training
 
 
 @contextmanager
@@ -100,7 +101,7 @@ class VlmLocReleaseTests(unittest.TestCase):
                 "cell_size_m": 30.0,
                 "bev_range_m": 30.0,
                 "image_size_px": 224,
-                "base_model_id": QWEN3_VL_8B_MODEL_ID,
+                "base_model_id": QWEN3_VL_32B_MODEL_ID,
                 "source_commit": OFFICIAL_SOURCE_COMMIT,
                 "query_order_sha256": "a" * 64,
                 "cell_order_sha256": "b" * 64,
@@ -135,7 +136,7 @@ class VlmLocReleaseTests(unittest.TestCase):
                 "cell_size_m": 30.0,
                 "bev_range_m": 30.0,
                 "image_size_px": 224,
-                "base_model_id": QWEN3_VL_8B_MODEL_ID,
+                "base_model_id": QWEN3_VL_32B_MODEL_ID,
                 "source_commit": OFFICIAL_SOURCE_COMMIT,
                 "query_order_sha256": "9" * 64,
                 "cell_order_sha256": "b" * 64,
@@ -216,6 +217,61 @@ class VlmLocReleaseTests(unittest.TestCase):
         self.assertNotEqual(paths["public_adapter"], paths["table8_adapter"])
         self.assertIn("output", paths["public_adapter"].parts)
         self.assertIn("table8_kitti360pose_30m", paths["table8_adapter"].parts)
+        self.assertIn("qwen3_vl_32b", paths["table8_adapter"].parts)
+        self.assertEqual(
+            paths["base_model"].name, "Qwen3-VL-32B-Instruct"
+        )
+
+    def test_qwen32_finalizer_proves_global_batch_four(self) -> None:
+        with workspace_temp_directory() as directory:
+            training = directory / "training.json"
+            validation = directory / "validation.json"
+            training.write_text("[]", encoding="utf-8")
+            validation.write_text("[]", encoding="utf-8")
+            adapter = {
+                "peft_type": "LORA",
+                "task_type": "CAUSAL_LM",
+                "rank": 8,
+                "lora_alpha": 16,
+                "training_model_type": "qwen3_vl",
+                "training_template": "qwen3_vl",
+                "training_type": "lora",
+                "torch_dtype": "bfloat16",
+                "training_target_modules": ["all-linear"],
+                "training_num_epochs": 2.0,
+                "training_learning_rate": 1e-4,
+                "training_attention_implementation": "flash_attn",
+                "training_per_device_batch_size": 1,
+                "training_gradient_accumulation_steps": 1,
+                "training_seed": 42,
+                "data_seed": 42,
+                "base_model_name_or_path": (
+                    "/models/Qwen3-VL-32B-Instruct"
+                ),
+                "training_model": "/models/Qwen3-VL-32B-Instruct",
+                "training_datasets": [str(training)],
+                "validation_datasets": [str(validation)],
+                "internal_shape_mismatches": [],
+                "unpaired_lora_keys": [],
+            }
+            passed = _validate_training(
+                adapter=adapter,
+                training_path=training,
+                validation_path=validation,
+                training_world_size=4,
+            )
+            self.assertTrue(passed["compatible"])
+            self.assertEqual(passed["effective_global_batch_size"], 4)
+            failed = _validate_training(
+                adapter=adapter,
+                training_path=training,
+                validation_path=validation,
+                training_world_size=2,
+            )
+            self.assertFalse(failed["compatible"])
+            self.assertIn(
+                "effective_global_batch_size", failed["mismatches"]
+            )
 
     def test_environment_audit_does_not_install_or_guess_versions(self) -> None:
         audit = inspect_python_environment()

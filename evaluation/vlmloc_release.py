@@ -20,17 +20,17 @@ from typing import Any, Iterable
 OFFICIAL_SOURCE_REPOSITORY = "https://github.com/MCG-NKU/nku-3d-vision.git"
 OFFICIAL_SOURCE_COMMIT = "494a8b4e3fe9226849697e11d85e70a98e071283"
 OFFICIAL_HF_DATASET = "kang233/VLM-Loc"
-QWEN3_VL_8B_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
-QWEN3_VL_8B_ARCHITECTURE = "Qwen3VLForConditionalGeneration"
+QWEN3_VL_32B_MODEL_ID = "Qwen/Qwen3-VL-32B-Instruct"
+QWEN3_VL_ARCHITECTURE = "Qwen3VLForConditionalGeneration"
 
-PUBLIC_QWEN8_ADAPTER_RELATIVE = Path(
-    "output/v0-20251101-125202-qwen3_8b/checkpoint-3600"
+PUBLIC_QWEN32_ADAPTER_RELATIVE = Path(
+    "output/v0-20251109-125010-qwen3_32b/checkpoint-3300"
 )
 TABLE8_ADAPTER_RELATIVE = Path(
-    "table8_kitti360pose_30m/qwen3_vl_8b"
+    "table8_kitti360pose_30m/qwen3_vl_32b"
 )
 TABLE8_PROVENANCE_NAME = "vlmloc_table8_provenance.json"
-DEFAULT_BASE_MODEL_RELATIVE = Path("base_models/Qwen3-VL-8B-Instruct")
+DEFAULT_BASE_MODEL_RELATIVE = Path("base_models/Qwen3-VL-32B-Instruct")
 DEFAULT_OFFICIAL_SOURCE_RELATIVE = Path(
     f"official_source/nku-3d-vision-{OFFICIAL_SOURCE_COMMIT[:12]}"
 )
@@ -261,8 +261,8 @@ def inspect_full_model(model_dir: Path) -> dict[str, Any]:
             {
                 "model_type": config.get("model_type"),
                 "architectures": architectures,
-                "architecture_matches_qwen3_vl_8b": (
-                    QWEN3_VL_8B_ARCHITECTURE in architectures
+                "architecture_matches_qwen3_vl": (
+                    QWEN3_VL_ARCHITECTURE in architectures
                 ),
                 "config_sha256": sha256_file(config_path),
             }
@@ -584,8 +584,8 @@ def inspect_base_model(base_model_dir: Path) -> dict[str, Any]:
             {
                 "model_type": config.get("model_type"),
                 "architectures": architectures,
-                "architecture_matches_qwen3_vl_8b": (
-                    QWEN3_VL_8B_ARCHITECTURE in architectures
+                "architecture_matches_qwen3_vl": (
+                    QWEN3_VL_ARCHITECTURE in architectures
                 ),
                 "config_sha256": sha256_file(config_path),
             }
@@ -672,7 +672,7 @@ def validate_table8_provenance(
         "cell_size_m": 30.0,
         "bev_range_m": 30.0,
         "image_size_px": 224,
-        "base_model_id": QWEN3_VL_8B_MODEL_ID,
+        "base_model_id": QWEN3_VL_32B_MODEL_ID,
         "source_commit": OFFICIAL_SOURCE_COMMIT,
     }
     if current_query_order_sha256 is not None:
@@ -805,7 +805,7 @@ def validate_table8_artifact_hashes(
 def default_vlmloc_paths(vlmloc_root: Path) -> dict[str, Path]:
     vlmloc_root = Path(vlmloc_root).resolve()
     return {
-        "public_adapter": vlmloc_root / PUBLIC_QWEN8_ADAPTER_RELATIVE,
+        "public_adapter": vlmloc_root / PUBLIC_QWEN32_ADAPTER_RELATIVE,
         "table8_adapter": vlmloc_root / TABLE8_ADAPTER_RELATIVE,
         "table8_provenance": (
             vlmloc_root / TABLE8_ADAPTER_RELATIVE / TABLE8_PROVENANCE_NAME
