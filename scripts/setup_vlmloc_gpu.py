@@ -1,8 +1,8 @@
 """Download and audit the Qwen3-VL-32B/VLM-Loc assets on the GPU PC.
 
-This intentionally does not download CityLoc-C/CityLoc-K by default: those
-archives use the public 50 m CityLoc protocol and cannot stand in for the
-requested 30 m KITTI360Pose/Table-8 fine model.
+The public 32B adapter was trained on CityLoc-K/50 m. It can be evaluated on
+the unchanged local KITTI360Pose/30 m test set as a cross-dataset zero-shot
+run, but that run must not be labelled as a Table-8 reproduction.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from evaluation.vlmloc_release import (
     OFFICIAL_SOURCE_COMMIT,
     OFFICIAL_SOURCE_REPOSITORY,
     PUBLIC_QWEN32_ADAPTER_RELATIVE,
+    PUBLIC_QWEN32_ADAPTER_SHA256,
     PUBLIC_RELEASE_FILES,
     QWEN3_VL_32B_MODEL_ID,
     default_vlmloc_paths,
@@ -219,6 +220,16 @@ def _download_official_source(vlmloc_root: Path) -> Path:
 def _audit(vlmloc_root: Path) -> dict[str, Any]:
     paths = default_vlmloc_paths(vlmloc_root)
     public_adapter = _find_public_qwen32_adapter(vlmloc_root)
+    public_adapter_audit = (
+        inspect_adapter(public_adapter) if public_adapter else None
+    )
+    public_adapter_hashes_match = bool(
+        public_adapter_audit
+        and all(
+            public_adapter_audit.get(key) == expected
+            for key, expected in PUBLIC_QWEN32_ADAPTER_SHA256.items()
+        )
+    )
     report: dict[str, Any] = {
         "schema_version": 1,
         "vlmloc_root": str(vlmloc_root.resolve()),
@@ -227,8 +238,12 @@ def _audit(vlmloc_root: Path) -> dict[str, Any]:
         "official_source_commit": OFFICIAL_SOURCE_COMMIT,
         "base_model_id": QWEN3_VL_32B_MODEL_ID,
         "public_release_files": PUBLIC_RELEASE_FILES,
-        "public_qwen32_adapter": (
-            inspect_adapter(public_adapter) if public_adapter else None
+        "public_qwen32_adapter": public_adapter_audit,
+        "expected_public_qwen32_adapter_sha256": (
+            PUBLIC_QWEN32_ADAPTER_SHA256
+        ),
+        "public_qwen32_adapter_hashes_match": (
+            public_adapter_hashes_match
         ),
         "base_model": inspect_base_model(paths["base_model"]),
         "official_source": inspect_official_source(paths["official_source"]),
@@ -248,7 +263,10 @@ def _audit(vlmloc_root: Path) -> dict[str, Any]:
     }
     report["public_assets_ready"] = bool(
         report["public_qwen32_adapter"]
+        and report["public_qwen32_adapter_hashes_match"]
         and report["base_model"].get("architecture_matches_qwen3_vl")
+        and report["base_model"].get("configured_as_bfloat16")
+        and not report["base_model"].get("quantization_config_present", True)
         and not report["base_model"].get("missing_base_shards", ["unknown"])
         and report["official_source"].get("source_commit_matches")
         and not report["official_source"].get("missing_required_source_files")
@@ -300,6 +318,16 @@ def build_parser() -> argparse.ArgumentParser:
             "public adapter is skipped."
         ),
     )
+    parser.add_argument(
+        "--public-qwen32-evaluation",
+        action="store_true",
+        help=(
+            "Download/audit the public CityLoc-K Qwen3-VL-32B adapter, "
+            "pinned source, and BF16 base weights for evaluation only. "
+            "Success requires public_assets_ready, not an unpublished "
+            "KITTI360Pose/Table-8 adapter."
+        ),
+    )
     return parser
 
 
@@ -346,6 +374,8 @@ def main() -> int:
         cli.table8_like_retraining
         and report["table8_like_retraining_assets_ready"]
     ):
+        return 0
+    if cli.public_qwen32_evaluation and report["public_assets_ready"]:
         return 0
     if not report["requested_table8_assets_ready"]:
         print(

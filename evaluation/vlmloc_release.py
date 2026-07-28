@@ -26,6 +26,17 @@ QWEN3_VL_ARCHITECTURE = "Qwen3VLForConditionalGeneration"
 PUBLIC_QWEN32_ADAPTER_RELATIVE = Path(
     "output/v0-20251109-125010-qwen3_32b/checkpoint-3300"
 )
+PUBLIC_QWEN32_ADAPTER_SHA256 = {
+    "adapter_config_sha256": (
+        "fec4addb4d91b8d6137bfdbd9ba4398092d150574b70b5b5a3620e8096b56aba"
+    ),
+    "adapter_weights_sha256": (
+        "9250b76f230bfb04a94f4199791b440c3cb0028751ba3bc9fc66ca44cf02bbb2"
+    ),
+    "args_sha256": (
+        "d729fac97776adfdeb35dca148afad64d1c00a26051a5d38d04e9ba093da1681"
+    ),
+}
 TABLE8_ADAPTER_RELATIVE = Path(
     "table8_kitti360pose_30m/qwen3_vl_32b"
 )
@@ -59,6 +70,7 @@ def inspect_python_environment() -> dict[str, Any]:
         "ms-swift",
         "qwen-vl-utils",
         "decord",
+        "accelerate",
     )
     versions: dict[str, str | None] = {}
     for name in distributions:
@@ -257,10 +269,22 @@ def inspect_full_model(model_dir: Path) -> dict[str, Any]:
     if config_path.is_file():
         config = json.loads(config_path.read_text(encoding="utf-8"))
         architectures = config.get("architectures") or []
+        text_config = config.get("text_config") or {}
+        configured_dtype = (
+            config.get("dtype")
+            or config.get("torch_dtype")
+            or text_config.get("dtype")
+            or text_config.get("torch_dtype")
+        )
         record.update(
             {
                 "model_type": config.get("model_type"),
                 "architectures": architectures,
+                "configured_weight_dtype": configured_dtype,
+                "configured_as_bfloat16": configured_dtype == "bfloat16",
+                "quantization_config_present": bool(
+                    config.get("quantization_config")
+                ),
                 "architecture_matches_qwen3_vl": (
                     QWEN3_VL_ARCHITECTURE in architectures
                 ),
@@ -580,10 +604,22 @@ def inspect_base_model(base_model_dir: Path) -> dict[str, Any]:
     if config_path.is_file():
         config = json.loads(config_path.read_text(encoding="utf-8"))
         architectures = config.get("architectures") or []
+        text_config = config.get("text_config") or {}
+        configured_dtype = (
+            config.get("dtype")
+            or config.get("torch_dtype")
+            or text_config.get("dtype")
+            or text_config.get("torch_dtype")
+        )
         record.update(
             {
                 "model_type": config.get("model_type"),
                 "architectures": architectures,
+                "configured_weight_dtype": configured_dtype,
+                "configured_as_bfloat16": configured_dtype == "bfloat16",
+                "quantization_config_present": bool(
+                    config.get("quantization_config")
+                ),
                 "architecture_matches_qwen3_vl": (
                     QWEN3_VL_ARCHITECTURE in architectures
                 ),

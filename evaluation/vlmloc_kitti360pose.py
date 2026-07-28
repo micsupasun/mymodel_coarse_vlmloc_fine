@@ -1,4 +1,4 @@
-"""Prepare and score the Table-8-like KITTI360Pose VLM-Loc fine stage.
+"""Prepare and score the KITTI360Pose VLM-Loc fine stage.
 
 The public VLM-Loc release only provides CityLoc 50 m data/adapters.  This
 module creates a separate bundle of VLM input representations (BEV images and
@@ -7,10 +7,11 @@ new KITTI360Pose samples or modify the source dataset.  Test examples use the
 exact CMMLoc Top-1 candidate stored in the checksummed Table-8-like manifest.
 
 The local processed cells do not contain the dense ``xyz_raw``/``rgb_raw``
-fields used by the public CityLoc renderer.  Images generated here therefore
+fields used by the public CityLoc renderer. Images generated here therefore
 use the cell's downsampled normalized points and are labeled accordingly in
-the preparation audit.  They must be used with an adapter retrained on these
-same images; a public CityLoc adapter is never substituted.
+the preparation audit. A public CityLoc adapter may be evaluated zero-shot,
+but the result is explicitly labelled cross-dataset and not a Table-8
+reproduction.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from evaluation.table8_like_protocol import (
     load_table8_like_manifest,
 )
 from evaluation.vlmloc_release import (
+    PUBLIC_QWEN32_ADAPTER_SHA256,
     QWEN3_VL_ARCHITECTURE,
     TABLE8_PROVENANCE_NAME,
     audit_merged_lora_application,
@@ -1400,6 +1402,7 @@ def prepare_vlmloc_data(
     raw_kitti360_root: Path | None = None,
     require_dense_raw: bool = False,
     allow_processed_missing_raw_fallback: bool = False,
+    evaluation_only: bool = False,
 ) -> Path:
     from datapreparation.kitti360pose import utils as source_utils
 
@@ -1441,28 +1444,39 @@ def prepare_vlmloc_data(
     source_snapshot_before = _source_tree_metadata_snapshot(data_root)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    training_path, training_stats = _prepare_gt_split(
-        data_root,
-        SCENE_NAMES_TRAIN,
-        output_dir=output_dir,
-        split_name="training",
-        overwrite_images=overwrite_images,
-        raw_kitti360_root=raw_kitti360_root,
-        allow_processed_missing_raw_fallback=(
-            allow_processed_missing_raw_fallback
-        ),
-    )
-    validation_path, validation_stats = _prepare_gt_split(
-        data_root,
-        SCENE_NAMES_VAL,
-        output_dir=output_dir,
-        split_name="validation",
-        overwrite_images=overwrite_images,
-        raw_kitti360_root=raw_kitti360_root,
-        allow_processed_missing_raw_fallback=(
-            allow_processed_missing_raw_fallback
-        ),
-    )
+    training_path = None
+    validation_path = None
+    training_stats: dict[str, Any] = {
+        "skipped": evaluation_only,
+        "sample_count": 0,
+    }
+    validation_stats: dict[str, Any] = {
+        "skipped": evaluation_only,
+        "sample_count": 0,
+    }
+    if not evaluation_only:
+        training_path, training_stats = _prepare_gt_split(
+            data_root,
+            SCENE_NAMES_TRAIN,
+            output_dir=output_dir,
+            split_name="training",
+            overwrite_images=overwrite_images,
+            raw_kitti360_root=raw_kitti360_root,
+            allow_processed_missing_raw_fallback=(
+                allow_processed_missing_raw_fallback
+            ),
+        )
+        validation_path, validation_stats = _prepare_gt_split(
+            data_root,
+            SCENE_NAMES_VAL,
+            output_dir=output_dir,
+            split_name="validation",
+            overwrite_images=overwrite_images,
+            raw_kitti360_root=raw_kitti360_root,
+            allow_processed_missing_raw_fallback=(
+                allow_processed_missing_raw_fallback
+            ),
+        )
 
     test_dataset = load_ordered_dataset(data_root, SCENE_NAMES_TEST)
     signature = dataset_signature(test_dataset)
@@ -1612,8 +1626,9 @@ def prepare_vlmloc_data(
     renderer_name = selected_renderer_name
     audit = {
         "schema_version": 1,
-        "backend": "vlmloc_kitti360pose_30m_retrained",
-        "comparison_scope": "table8_like_full_test_11505",
+        "backend": "vlmloc_kitti360pose_30m_evaluation_inputs",
+        "evaluation_only": evaluation_only,
+        "comparison_scope": "full_local_test_11505",
         "source_dataset_immutability": {
             "source_dataset_modified": False,
             "new_kitti360pose_samples_added": 0,
@@ -1688,8 +1703,12 @@ def prepare_vlmloc_data(
         "cmmloc_retrieval_rows_sha256": manifest[
             "retrieval_rows_sha256"
         ],
-        "training_dataset_path": str(training_path.resolve()),
-        "validation_dataset_path": str(validation_path.resolve()),
+        "training_dataset_path": (
+            str(training_path.resolve()) if training_path else None
+        ),
+        "validation_dataset_path": (
+            str(validation_path.resolve()) if validation_path else None
+        ),
         "testing_dataset_path": str(testing_path.resolve()),
     }
     audit_path = output_dir / "vlmloc_data_preparation_audit.json"
@@ -1991,6 +2010,198 @@ def audit_vlmloc_runtime_preflight(
     return report_path
 
 
+def audit_public_qwen32_runtime_preflight(
+    *,
+    adapter_dir: Path,
+    base_model_dir: Path,
+    official_source_dir: Path,
+    data_dir: Path,
+    smoke_predictions_path: Path,
+    output_dir: Path,
+    require_dense_raw: bool = False,
+) -> Path:
+    """Audit the public CityLoc-K 32B adapter for zero-shot evaluation."""
+
+    adapter_dir = Path(adapter_dir).resolve()
+    base_model_dir = Path(base_model_dir).resolve()
+    official_source_dir = Path(official_source_dir).resolve()
+    data_dir = Path(data_dir).resolve()
+    smoke_predictions_path = Path(smoke_predictions_path).resolve()
+    preparation_path = data_dir / "vlmloc_data_preparation_audit.json"
+    preparation = (
+        json.loads(preparation_path.read_text(encoding="utf-8"))
+        if preparation_path.is_file()
+        else {}
+    )
+    adapter = inspect_adapter(adapter_dir)
+    base_model = inspect_base_model(base_model_dir)
+    source = inspect_official_source(official_source_dir)
+    environment = inspect_python_environment()
+
+    expected_data_files = {
+        "testing": data_dir / "vlmloc_testing_data.json",
+        "test_index": data_dir / "vlmloc_testing_index.json",
+        "smoke": data_dir / "vlmloc_testing_smoke_1.json",
+    }
+    recorded_hashes = {
+        "testing": preparation.get("testing", {}).get(
+            "dataset_json_sha256"
+        ),
+        "test_index": preparation.get("testing", {}).get("index_sha256"),
+        "smoke": preparation.get("testing", {}).get(
+            "smoke_dataset_sha256"
+        ),
+    }
+    data_file_audit = {
+        name: {
+            "path": str(path.resolve()),
+            "exists": path.is_file(),
+            "sha256": _sha256_file(path) if path.is_file() else None,
+            "recorded_sha256": recorded_hashes[name],
+        }
+        for name, path in expected_data_files.items()
+    }
+    data_hashes_match = all(
+        record["exists"]
+        and record["sha256"] == record["recorded_sha256"]
+        for record in data_file_audit.values()
+    )
+    adapter_hash_mismatches = {
+        key: {
+            "expected": expected,
+            "actual": adapter.get(key),
+        }
+        for key, expected in PUBLIC_QWEN32_ADAPTER_SHA256.items()
+        if adapter.get(key) != expected
+    }
+    adapter_metadata_matches = all(
+        (
+            adapter.get("peft_type") == "LORA",
+            adapter.get("task_type") == "CAUSAL_LM",
+            adapter.get("rank") == 8,
+            adapter.get("lora_alpha") == 16,
+            adapter.get("training_model_type") == "qwen3_vl",
+            adapter.get("training_template") == "qwen3_vl",
+            adapter.get("training_type") == "lora",
+            adapter.get("torch_dtype") == "bfloat16",
+            adapter.get("training_target_modules") == ["all-linear"],
+            adapter.get("training_freeze_vit") is False,
+            adapter.get("training_freeze_aligner") is False,
+        )
+    )
+    smoke_rows = (
+        _load_jsonl(smoke_predictions_path)
+        if smoke_predictions_path.is_file()
+        else []
+    )
+    smoke_point = (
+        _response_point(smoke_rows[0]) if len(smoke_rows) == 1 else None
+    )
+    renderer = preparation.get("renderer")
+    renderer_requirement_met = (
+        renderer in {DENSE_RAW_RENDERER_NAME, HYBRID_RAW_RENDERER_NAME}
+        if require_dense_raw
+        else renderer in SUPPORTED_RENDERERS
+    )
+    packages = environment.get("package_versions", {})
+    checks = {
+        "evaluation_only_test_data_complete_and_hashes_match": bool(
+            preparation
+            and preparation.get("evaluation_only") is True
+            and renderer_requirement_met
+            and preparation.get("source_dataset_immutability", {}).get(
+                "source_dataset_modified"
+            )
+            is False
+            and preparation.get("source_dataset_immutability", {}).get(
+                "new_kitti360pose_samples_added"
+            )
+            == 0
+            and preparation.get("testing", {}).get("sample_count")
+            == QUERY_COUNT
+            and data_hashes_match
+        ),
+        "public_cityloc_qwen32_adapter_identity_and_lora_shapes": bool(
+            adapter.get("adapter_config_exists")
+            and adapter.get("adapter_weights_exists")
+            and adapter.get("args_exists")
+            and not adapter_hash_mismatches
+            and adapter_metadata_matches
+            and not adapter.get("internal_shape_mismatches", ["missing"])
+            and not adapter.get("unpaired_lora_keys", ["missing"])
+        ),
+        "qwen3_vl_32b_bf16_base_model_complete": bool(
+            base_model.get("architecture_matches_qwen3_vl")
+            and base_model.get("configured_as_bfloat16")
+            and not base_model.get("quantization_config_present", True)
+            and not base_model.get("missing_base_shards", ["not-audited"])
+            and isinstance(base_model.get("resolved_model_revision"), str)
+            and bool(
+                re.fullmatch(
+                    r"[0-9a-f]{40}",
+                    base_model["resolved_model_revision"],
+                )
+            )
+        ),
+        "official_source_and_inference_environment": bool(
+            source.get("source_commit_matches")
+            and not source.get("missing_required_source_files", ["missing"])
+            and packages.get("ms-swift")
+            and packages.get("transformers")
+            and packages.get("peft")
+            and packages.get("accelerate")
+        ),
+        "one_query_runtime_model_load_and_generation_smoke": bool(
+            len(smoke_rows) == 1 and smoke_point is not None
+        ),
+    }
+    report = {
+        "schema_version": 1,
+        "backend": "vlmloc_qwen3_vl_32b_public_cityloc_zero_shot",
+        "protocol": "CMMLoc release Top-1 -> public VLM-Loc Qwen3-VL-32B",
+        "comparison_scope": "cross_dataset_zero_shot_full_local_test_11505",
+        "training_performed": False,
+        "adapter_training_dataset": "CityLoc-K/50m",
+        "evaluation_dataset": "KITTI360Pose/30m unchanged local test split",
+        "table8_reproduction": False,
+        "table8_scope_note": (
+            "Table 8 retrains VLM-Loc on KITTI360Pose. The public 32B "
+            "adapter was trained on CityLoc-K/50m, so this is a zero-shot "
+            "cross-dataset evaluation rather than a Table-8 reproduction."
+        ),
+        "adapter_audit": adapter,
+        "expected_public_adapter_sha256": PUBLIC_QWEN32_ADAPTER_SHA256,
+        "adapter_hash_mismatches": adapter_hash_mismatches,
+        "base_model_audit": base_model,
+        "expected_base_architecture": QWEN3_VL_ARCHITECTURE,
+        "official_source_audit": source,
+        "python_environment_audit": environment,
+        "preparation_audit_path": str(preparation_path),
+        "preparation_audit": preparation,
+        "require_dense_raw": require_dense_raw,
+        "prepared_data_files": data_file_audit,
+        "smoke_predictions_path": str(smoke_predictions_path),
+        "smoke_predictions_sha256": (
+            _sha256_file(smoke_predictions_path)
+            if smoke_predictions_path.is_file()
+            else None
+        ),
+        "smoke_prediction_count": len(smoke_rows),
+        "smoke_point_2d": list(smoke_point) if smoke_point else None,
+        "checks": checks,
+        "compatible": all(checks.values()),
+        "load_attempted": bool(smoke_rows),
+        "load_succeeded": checks[
+            "one_query_runtime_model_load_and_generation_smoke"
+        ],
+    }
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "vlmloc_runtime_preflight.json"
+    _write_json_atomic(report_path, report)
+    return report_path
+
+
 def _safe_response_json(value: Any) -> dict[str, Any] | None:
     if isinstance(value, dict):
         return value
@@ -2199,7 +2410,17 @@ def evaluate_vlmloc_predictions(
     predictions_path: Path,
     test_index_path: Path,
     output_dir: Path,
+    evaluation_mode: str = "retrained_kitti360pose",
 ) -> Path:
+    supported_modes = {
+        "retrained_kitti360pose",
+        "public_qwen32_cityloc_zero_shot",
+    }
+    if evaluation_mode not in supported_modes:
+        raise ValueError(
+            f"unsupported evaluation_mode={evaluation_mode!r}; "
+            f"expected one of {sorted(supported_modes)}"
+        )
     predictions = _load_jsonl(predictions_path)
     test_index = json.loads(
         Path(test_index_path).read_text(encoding="utf-8")
@@ -2299,10 +2520,30 @@ def evaluate_vlmloc_predictions(
             for row in test_index
         }
     )
+    public_zero_shot = (
+        evaluation_mode == "public_qwen32_cityloc_zero_shot"
+    )
     result = {
         "schema_version": 1,
-        "backend": "vlmloc_kitti360pose_30m_retrained",
-        "protocol": "CMMLoc release coarse Top-1 -> VLM-Loc fine",
+        "backend": (
+            "vlmloc_qwen3_vl_32b_public_cityloc_zero_shot"
+            if public_zero_shot
+            else "vlmloc_kitti360pose_30m_retrained"
+        ),
+        "protocol": (
+            "CMMLoc release coarse Top-1 -> public VLM-Loc "
+            "Qwen3-VL-32B zero-shot fine"
+            if public_zero_shot
+            else "CMMLoc release coarse Top-1 -> VLM-Loc fine"
+        ),
+        "evaluation_mode": evaluation_mode,
+        "training_performed_in_this_workflow": False,
+        "adapter_training_dataset": (
+            "CityLoc-K/50m" if public_zero_shot else "KITTI360Pose/30m"
+        ),
+        "evaluation_dataset": "KITTI360Pose/30m unchanged local test split",
+        "table8_reproduction": False,
+        "table8_like_retrained": not public_zero_shot,
         "query_count": total,
         "valid_prediction_count": len(errors_m),
         "invalid_prediction_count": invalid,
@@ -2335,10 +2576,20 @@ def evaluate_vlmloc_predictions(
             for threshold, reference in paper_reference.items()
         },
         "comparison_warning": (
-            "The reference uses the paper's 11,404-query/dense-raw-renderer "
-            "setup. This result uses all 11,505 local queries and a separately "
-            "retrained checkpoint. Even with dense raw points, closeness is a "
-            "sanity check rather than an exact reproduction criterion."
+            (
+                "The public Qwen3-VL-32B VLM-Loc adapter was trained on "
+                "CityLoc-K/50m, while this evaluation uses the unchanged "
+                "KITTI360Pose/30m test set. Report this as cross-dataset "
+                "zero-shot evaluation, not as a Table-8 reproduction."
+            )
+            if public_zero_shot
+            else (
+                "The reference uses the paper's 11,404-query/dense-raw-"
+                "renderer setup. This result uses all 11,505 local queries "
+                "and a separately retrained checkpoint. Even with dense raw "
+                "points, closeness is a sanity check rather than an exact "
+                "reproduction criterion."
+            )
         ),
         "mean_error_m_valid_only": (
             float(np.mean(errors_m)) if errors_m else None

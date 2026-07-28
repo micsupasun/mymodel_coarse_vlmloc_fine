@@ -12,6 +12,7 @@ from evaluation.vlmloc_release import (
     EXPECTED_DATASET_TOKEN,
     EXPECTED_TEST_SCENES,
     OFFICIAL_SOURCE_COMMIT,
+    PUBLIC_QWEN32_ADAPTER_SHA256,
     QWEN3_VL_32B_MODEL_ID,
     TABLE8_PROVENANCE_NAME,
     dataset_tokens,
@@ -220,6 +221,20 @@ class VlmLocReleaseTests(unittest.TestCase):
         self.assertIn("qwen3_vl_32b", paths["table8_adapter"].parts)
         self.assertEqual(
             paths["base_model"].name, "Qwen3-VL-32B-Instruct"
+        )
+        self.assertEqual(
+            set(PUBLIC_QWEN32_ADAPTER_SHA256),
+            {
+                "adapter_config_sha256",
+                "adapter_weights_sha256",
+                "args_sha256",
+            },
+        )
+        self.assertTrue(
+            all(
+                len(value) == 64
+                for value in PUBLIC_QWEN32_ADAPTER_SHA256.values()
+            )
         )
 
     def test_qwen32_finalizer_proves_global_batch_four(self) -> None:

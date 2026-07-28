@@ -74,6 +74,7 @@ from evaluation.table8_reproduction import (
 )
 from evaluation.table8_like_protocol import write_table8_like_manifest
 from evaluation.vlmloc_kitti360pose import (
+    audit_public_qwen32_runtime_preflight,
     audit_vlmloc_merged_checkpoint,
     audit_vlmloc_runtime_preflight,
     evaluate_vlmloc_predictions,
@@ -1472,6 +1473,7 @@ def command_table8_like_vlmloc_prepare(
         allow_processed_missing_raw_fallback=(
             cli.allow_processed_missing_raw_fallback
         ),
+        evaluation_only=cli.evaluation_only,
     )
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     print(f"VLM-Loc 30 m derived-input audit: {audit_path}")
@@ -1502,10 +1504,16 @@ def command_table8_like_vlmloc_prepare(
         "new KITTI360Pose samples added: "
         f"{audit['source_dataset_immutability']['new_kitti360pose_samples_added']}"
     )
-    print(
-        "The VLM-Loc adapter must be retrained on these exact generated "
-        "images before fine inference."
-    )
+    if cli.evaluation_only:
+        print(
+            "Evaluation-only preparation: training and validation inputs "
+            "were not generated."
+        )
+    else:
+        print(
+            "Training inputs were generated for an explicitly separate "
+            "retraining workflow."
+        )
     return 0
 
 
@@ -1518,6 +1526,7 @@ def command_table8_like_vlmloc_evaluate(
         predictions_path=Path(cli.predictions),
         test_index_path=Path(cli.test_index),
         output_dir=Path(cli.output_dir),
+        evaluation_mode=cli.evaluation_mode,
     )
     result = json.loads(result_path.read_text(encoding="utf-8"))
     print(
@@ -1538,7 +1547,12 @@ def command_table8_like_vlmloc_preflight(
     cli: argparse.Namespace,
 ) -> int:
     checkpoint_root = Path(cli.checkpoint_root).resolve()
-    report_path = audit_vlmloc_runtime_preflight(
+    audit_function = (
+        audit_public_qwen32_runtime_preflight
+        if cli.public_qwen32_zero_shot
+        else audit_vlmloc_runtime_preflight
+    )
+    report_path = audit_function(
         adapter_dir=Path(cli.adapter_dir),
         base_model_dir=(
             checkpoint_root
@@ -1925,6 +1939,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite-images", action="store_true"
     )
     table8_like_vlmloc_prepare.add_argument(
+        "--evaluation-only",
+        action="store_true",
+        help=(
+            "Generate only ordered test/smoke inputs and the test index. "
+            "Do not generate training or validation inputs."
+        ),
+    )
+    table8_like_vlmloc_prepare.add_argument(
         "--raw-kitti360-root",
         help=(
             "KITTI-360 root containing data_3d_semantics. When supplied, "
@@ -1972,6 +1994,14 @@ def build_parser() -> argparse.ArgumentParser:
     table8_like_vlmloc_evaluate.add_argument(
         "--output-dir", required=True
     )
+    table8_like_vlmloc_evaluate.add_argument(
+        "--evaluation-mode",
+        choices=(
+            "retrained_kitti360pose",
+            "public_qwen32_cityloc_zero_shot",
+        ),
+        default="retrained_kitti360pose",
+    )
     table8_like_vlmloc_evaluate.set_defaults(
         handler=command_table8_like_vlmloc_evaluate
     )
@@ -1997,6 +2027,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     table8_like_vlmloc_preflight.add_argument(
         "--output-dir", required=True
+    )
+    table8_like_vlmloc_preflight.add_argument(
+        "--public-qwen32-zero-shot",
+        action="store_true",
+        help=(
+            "Audit the exact public CityLoc-K Qwen3-VL-32B adapter for "
+            "cross-dataset evaluation without retraining."
+        ),
     )
     table8_like_vlmloc_preflight.add_argument(
         "--require-dense-raw",

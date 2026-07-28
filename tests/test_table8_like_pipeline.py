@@ -757,6 +757,7 @@ class Table8LikePipelineTests(unittest.TestCase):
                     predictions_path=predictions_path,
                     test_index_path=index_path,
                     output_dir=directory / "metrics",
+                    evaluation_mode="public_qwen32_cityloc_zero_shot",
                 )
             result = json.loads(result_path.read_text(encoding="utf-8"))
             self.assertEqual(result["valid_prediction_count"], 1)
@@ -768,6 +769,15 @@ class Table8LikePipelineTests(unittest.TestCase):
                 result["candidate_geometry_upper_bound_recall"]["5"],
                 1.0,
             )
+            self.assertEqual(
+                result["backend"],
+                "vlmloc_qwen3_vl_32b_public_cityloc_zero_shot",
+            )
+            self.assertEqual(
+                result["adapter_training_dataset"], "CityLoc-K/50m"
+            )
+            self.assertFalse(result["training_performed_in_this_workflow"])
+            self.assertFalse(result["table8_reproduction"])
         finally:
             shutil.rmtree(directory)
             try:
